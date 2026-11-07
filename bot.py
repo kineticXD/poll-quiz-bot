@@ -7,6 +7,7 @@ from threading import Thread
 from flask import Flask
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.error import RetryAfter  # <-- Added for rate limit handling
 import motor.motor_asyncio
 
 # --- Keep Alive Server ---
@@ -135,23 +136,53 @@ def parse_multiple_quizzes(text: str):
 
     return quizzes
 
-# --- Poll Sending Logic ---
+# --- Poll Sending Logic (WITH RATE LIMIT FIX) ---
 async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, anonymous: bool, timer: int, message_thread_id: int = None):
+    """Sends polls directly to the chat, handling Telegram rate limits automatically."""
     for i, quiz in enumerate(quizzes):
-        try:
-            if len(quiz['question']) > 300:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Question {i+1} is too long (Max 300 chars). Skipped.", message_thread_id=message_thread_id)
-                continue
+        success = False
+        while not success:
+            try:
+                if len(quiz['question']) > 300:
+                    await context.bot.send_message(
+                        chat_id=chat_id, 
+                        text=f"⚠️ Question {i+1} is too long (Max 300 chars). Skipped.",
+                        message_thread_id=message_thread_id
+                    )
+                    success = True
+                    continue
+                    
+                await context.bot.send_poll(
+                    chat_id=chat_id,
+                    question=quiz['question'],
+                    options=quiz['options'],
+                    type=Poll.QUIZ,
+                    correct_option_id=quiz['correct_id'],
+                    explanation=quiz['explanation'][:200],
+                    is_anonymous=anonymous,
+                    open_period=timer if timer >= 5 else None, 
+                    protect_content=False,
+                    message_thread_id=message_thread_id
+                )
+                success = True
                 
-            await context.bot.send_poll(
-                chat_id=chat_id, question=quiz['question'], options=quiz['options'], type=Poll.QUIZ,
-                correct_option_id=quiz['correct_id'], explanation=quiz['explanation'][:200],
-                is_anonymous=anonymous, open_period=timer if timer >= 5 else None, 
-                protect_content=False, message_thread_id=message_thread_id
-            )
-            await asyncio.sleep(1) 
-        except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}", message_thread_id=message_thread_id)
+                # Safely wait 3.5 seconds between polls to avoid hitting the 20/min limit
+                await asyncio.sleep(3.5) 
+                
+            except RetryAfter as e:
+                # Telegram explicitly told us to wait
+                wait_time = e.retry_after + 2
+                print(f"Rate limit hit. Waiting {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+                # The while loop will automatically retry the current poll
+                
+            except Exception as e:
+                await context.bot.send_message(
+                    chat_id=chat_id, 
+                    text=f"❌ Error on Q{i+1}: {str(e)}",
+                    message_thread_id=message_thread_id
+                )
+                success = True # Skip this poll and move to the next one
 
 # --- UI Menus ---
 def get_main_menu():
@@ -363,7 +394,7 @@ def main():
     # Handlers for Groups
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Ultimate Bot is running with File Upload support...")
+    print("Ultimate Bot is running with File Upload support and Rate Limit handling...")
     application.run_polling()
 
 if __name__ == "__main__":

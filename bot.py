@@ -9,7 +9,7 @@ from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import motor.motor_asyncio
 
-# --- Keep Alive Server for Render ---
+# --- Keep Alive Server ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -69,94 +69,100 @@ async def update_user_setting(user_id: int, key: str, value):
     if settings_collection is not None:
         await settings_collection.update_one({"user_id": user_id}, {"$set": {key: value}})
 
-# --- Quiz Parsing Logic ---
+# --- SMART Quiz Parsing Logic ---
 def parse_multiple_quizzes(text: str):
-    raw_blocks = re.split(r'\n\s*\n', text.strip())
-    parsed_quizzes = []
+    """
+    Iterates line-by-line. It ignores blank lines entirely.
+    When it sees a line after options have started, it assumes a new question began.
+    """
+    lines = text.strip().split('\n')
+    quizzes = []
+    
+    current_question_lines = []
+    current_options = []
+    current_correct_id = 0
+    current_explanation = ""
 
-    for block in raw_blocks:
-        if not block.strip():
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
-
-        lines = block.strip().split('\n')
-        question_lines = []
-        options = []
-        correct_option_id = 0
-        explanation = ""
-
-        for line in lines:
-            line = line.strip()
-            if re.match(r'^[a-zA-Z]\)', line):
-                option_text = re.sub(r'^[a-zA-Z]\)\s*', '', line)
-                if '✅' in option_text or '✔️' in option_text:
-                    correct_option_id = len(options)
-                    option_text = option_text.replace('✅', '').replace('✔️', '').strip()
-                options.append(option_text)
-            elif line.lower().startswith('explanation:') or line.lower().startswith('ex:'):
-                explanation = re.sub(r'^(explanation|ex):\s*', '', line, flags=re.IGNORECASE).strip()
+            
+        if re.match(r'^[a-zA-Z]\)', line):
+            # It's an option
+            if not current_question_lines: 
+                continue 
+            option_text = re.sub(r'^[a-zA-Z]\)\s*', '', line)
+            if '✅' in option_text or '✔️' in option_text:
+                current_correct_id = len(current_options)
+                option_text = option_text.replace('✅', '').replace('✔️', '').strip()
+            current_options.append(option_text)
+            
+        elif line.lower().startswith('explanation:') or line.lower().startswith('ex:'):
+            if current_question_lines:
+                current_explanation = re.sub(r'^(explanation|ex):\s*', '', line, flags=re.IGNORECASE).strip()
+                
+        else:
+            # It's a question line
+            if current_options:
+                # We already have options for the previous question. This is a new question.
+                q_text = "\n".join(current_question_lines).strip()
+                if q_text and 2 <= len(current_options) <= 10 and current_correct_id < len(current_options):
+                    quizzes.append({
+                        "question": q_text,
+                        "options": current_options,
+                        "correct_id": current_correct_id,
+                        "explanation": current_explanation or "No explanation provided."
+                    })
+                # Reset for the new question
+                current_question_lines = [line]
+                current_options = []
+                current_correct_id = 0
+                current_explanation = ""
             else:
-                if not options: 
-                    question_lines.append(line)
+                # Still reading the question stem
+                current_question_lines.append(line)
 
-        question = "\n".join(question_lines).strip()
+    # Save the very last quiz
+    q_text = "\n".join(current_question_lines).strip()
+    if q_text and 2 <= len(current_options) <= 10 and current_correct_id < len(current_options):
+        quizzes.append({
+            "question": q_text,
+            "options": current_options,
+            "correct_id": current_correct_id,
+            "explanation": current_explanation or "No explanation provided."
+        })
 
-        if question and 2 <= len(options) <= 10 and correct_option_id < len(options):
-            parsed_quizzes.append({
-                "question": question,
-                "options": options,
-                "correct_id": correct_option_id,
-                "explanation": explanation or "No explanation provided."
-            })
+    return quizzes
 
-    return parsed_quizzes
-
-# --- Poll Sending Logic (NOW WITH TOPIC SUPPORT) ---
+# --- Poll Sending Logic ---
 async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, anonymous: bool, timer: int, message_thread_id: int = None):
-    """Sends polls directly to the chat, optionally inside a specific forum topic."""
     for i, quiz in enumerate(quizzes):
         try:
             if len(quiz['question']) > 300:
-                await context.bot.send_message(
-                    chat_id=chat_id, 
-                    text=f"⚠️ Question {i+1} is too long (Max 300 chars). Skipped.",
-                    message_thread_id=message_thread_id
-                )
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Question {i+1} is too long (Max 300 chars). Skipped.", message_thread_id=message_thread_id)
                 continue
                 
             await context.bot.send_poll(
-                chat_id=chat_id,
-                question=quiz['question'],
-                options=quiz['options'],
-                type=Poll.QUIZ,
-                correct_option_id=quiz['correct_id'],
-                explanation=quiz['explanation'][:200],
-                is_anonymous=anonymous,
-                open_period=timer if timer >= 5 else None, 
-                protect_content=False,
-                message_thread_id=message_thread_id # Sends to the correct topic
+                chat_id=chat_id, question=quiz['question'], options=quiz['options'], type=Poll.QUIZ,
+                correct_option_id=quiz['correct_id'], explanation=quiz['explanation'][:200],
+                is_anonymous=anonymous, open_period=timer if timer >= 5 else None, 
+                protect_content=False, message_thread_id=message_thread_id
             )
             await asyncio.sleep(1) 
         except Exception as e:
-            await context.bot.send_message(
-                chat_id=chat_id, 
-                text=f"❌ Error on Q{i+1}: {str(e)}",
-                message_thread_id=message_thread_id
-            )
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}", message_thread_id=message_thread_id)
 
 # --- UI Menus ---
 def get_main_menu():
     keyboard = [
-        [InlineKeyboardButton("📚 My Quizzes", callback_data="my_quizzes"),
-         InlineKeyboardButton("➕ Create Guide", callback_data="create_guide")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-         InlineKeyboardButton("🌐 Support", url="https://t.me/telegram")]
+        [InlineKeyboardButton("📚 My Quizzes", callback_data="my_quizzes"), InlineKeyboardButton("➕ Create Guide", callback_data="create_guide")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"), InlineKeyboardButton("🌐 Support", url="https://t.me/telegram")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_settings_menu(settings):
     anon_status = "✅ ON" if settings['anonymous'] else "❌ OFF"
-    timer_status = f"{settings['timer']}s" if settings['timer'] > 0 else "OFF"
-    
     keyboard = [
         [InlineKeyboardButton(f"🕵️ Anonymous: {anon_status}", callback_data="toggle_anon")],
         [InlineKeyboardButton("⏱ Poll Timer", callback_data="timer_menu")],
@@ -166,23 +172,15 @@ def get_settings_menu(settings):
 
 def get_timer_menu():
     keyboard = [
-        [InlineKeyboardButton("OFF", callback_data="set_timer_0"),
-         InlineKeyboardButton("10s", callback_data="set_timer_10"),
-         InlineKeyboardButton("30s", callback_data="set_timer_30")],
-        [InlineKeyboardButton("1m", callback_data="set_timer_60"),
-         InlineKeyboardButton("3m", callback_data="set_timer_180"),
-         InlineKeyboardButton("5m", callback_data="set_timer_300")],
+        [InlineKeyboardButton("OFF", callback_data="set_timer_0"), InlineKeyboardButton("10s", callback_data="set_timer_10"), InlineKeyboardButton("30s", callback_data="set_timer_30")],
+        [InlineKeyboardButton("1m", callback_data="set_timer_60"), InlineKeyboardButton("3m", callback_data="set_timer_180"), InlineKeyboardButton("5m", callback_data="set_timer_300")],
         [InlineKeyboardButton("🔙 Back to Settings", callback_data="settings")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 <b>Welcome to the Ultimate Quiz Maker!</b>\n\n"
-        "I turn your text into beautiful, forwardable Telegram Quiz Polls.\n\n"
-        "💡 <i>Use the buttons below to navigate.</i>"
-    )
+    text = "👋 <b>Welcome to the Ultimate Quiz Maker!</b>\n\nI turn your text into beautiful, forwardable Telegram Quiz Polls.\n\n💡 <i>Use the buttons below to navigate.</i>"
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
@@ -197,7 +195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "create_guide":
         text = (
             "📝 <b>How to Create a Quiz</b>\n\n"
-            "Send me your quiz text. Separate multiple questions with a <b>blank line</b>.\n\n"
+            "Send me your quiz text directly, OR upload a <b>.txt file</b> (recommended for 50+ questions).\n\n"
             "<code>What is 2+2?\n"
             "a) 3\n"
             "b) 4 ✅\n"
@@ -224,40 +222,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if quizzes:
             keyboard.append([InlineKeyboardButton("🗑 Delete a Quiz", callback_data="delete_menu")])
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
-        
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         
     elif query.data == "delete_menu":
         quizzes = await get_user_quizzes(user_id)
-        keyboard = []
-        for q in quizzes[:10]:
-            keyboard.append([InlineKeyboardButton(f"🗑 {q['id']}", callback_data=f"del_{q['id']}")])
+        keyboard = [[InlineKeyboardButton(f"🗑 {q['id']}", callback_data=f"del_{q['id']}")] for q in quizzes[:10]]
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")])
-        
         await query.edit_message_text("Select a quiz to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
         
     elif query.data.startswith("del_"):
         quiz_id = query.data.split("_")[1]
         success = await delete_quiz_from_db(quiz_id, user_id)
-        if success:
-            await query.edit_message_text(f"✅ Quiz <code>{quiz_id}</code> deleted successfully!", parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")]]))
-        else:
-            await query.edit_message_text("❌ Failed to delete quiz.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")]]))
+        msg = f"✅ Quiz <code>{quiz_id}</code> deleted!" if success else "❌ Failed to delete."
+        await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")]]))
 
     elif query.data == "settings":
         settings = await get_user_settings(user_id)
-        text = "⚙️ <b>Bot Settings</b>\n\nCustomize how your quizzes are sent."
-        await query.edit_message_text(text, reply_markup=get_settings_menu(settings), parse_mode='HTML')
+        await query.edit_message_text("⚙️ <b>Bot Settings</b>\n\nCustomize how your quizzes are sent.", reply_markup=get_settings_menu(settings), parse_mode='HTML')
         
     elif query.data == "toggle_anon":
         settings = await get_user_settings(user_id)
-        new_anon = not settings['anonymous']
-        await update_user_setting(user_id, "anonymous", new_anon)
-        settings['anonymous'] = new_anon
+        await update_user_setting(user_id, "anonymous", not settings['anonymous'])
+        settings['anonymous'] = not settings['anonymous']
         await query.edit_message_reply_markup(reply_markup=get_settings_menu(settings))
         
     elif query.data == "timer_menu":
-        await query.edit_message_text("⏱ <b>Select Default Poll Timer:</b>\n<i>Applies to all quizzes. Override with /quizpoll ID seconds</i>", reply_markup=get_timer_menu(), parse_mode='HTML')
+        await query.edit_message_text("⏱ <b>Select Default Poll Timer:</b>\n<i>Override in chat with /quizpoll ID seconds</i>", reply_markup=get_timer_menu(), parse_mode='HTML')
         
     elif query.data.startswith("set_timer_"):
         timer = int(query.data.split("_")[2])
@@ -268,12 +258,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "back":
         await start(update, context)
 
-async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not re.search(r'^[a-zA-Z]\)', text, re.MULTILINE):
-        await update.message.reply_text("❌ <b>Format not recognized.</b>\nTap 'Create Guide' in the /start menu to see how.", parse_mode='HTML')
-        return
-
+async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     quiz_id = await save_quiz_to_db(text, update.effective_user.id)
     quizzes = parse_multiple_quizzes(text)
     
@@ -281,15 +266,38 @@ async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not parse any valid questions. Check your formatting.")
         return
 
-    success_text = (
-        f"✅ <b>Successfully Saved {len(quizzes)} Question(s)!</b>\n\n"
-        f"🆔 <b>Quiz ID:</b> <code>{quiz_id}</code>\n"
-        f"👉 <i>Use <code>/quizpoll {quiz_id}</code> in any group!</i>"
-    )
+    success_text = f"✅ <b>Successfully Saved {len(quizzes)} Question(s)!</b>\n\n🆔 <b>Quiz ID:</b> <code>{quiz_id}</code>\n👉 <i>Use <code>/quizpoll {quiz_id}</code> in any group!</i>"
     await update.message.reply_text(success_text, parse_mode='HTML')
     
     settings = await get_user_settings(update.effective_user.id)
     await send_polls(context, update.effective_chat.id, quizzes[:1], settings['anonymous'], settings['timer'])
+
+async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if not re.search(r'^[a-zA-Z]\)', text, re.MULTILINE):
+        await update.message.reply_text("❌ <b>Format not recognized.</b>\nTap 'Create Guide' in the /start menu.", parse_mode='HTML')
+        return
+    await process_and_save(update, context, text)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles .txt file uploads to bypass 4096 char limits."""
+    doc = update.message.document
+    if not doc.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ Please upload a standard `.txt` file.")
+        return
+    
+    msg = await update.message.reply_text("⏳ Downloading and parsing file...")
+    file = await context.bot.get_file(doc.file_id)
+    file_bytes = await file.download_as_bytearray()
+    
+    try:
+        text = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        await msg.edit_text("❌ Error: File must be UTF-8 encoded text.")
+        return
+        
+    await msg.delete()
+    await process_and_save(update, context, text)
 
 async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -298,32 +306,20 @@ async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     quiz_id = context.args[0].upper()
     saved_data = await get_quiz_from_db(quiz_id)
-
     if not saved_data:
         await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
         return
 
     settings = await get_user_settings(update.effective_user.id)
-    
     timer = settings['timer']
     if len(context.args) > 1:
-        try:
-            timer = int(context.args[1])
-        except ValueError:
-            pass
+        try: timer = int(context.args[1])
+        except ValueError: pass
 
     quizzes = parse_multiple_quizzes(saved_data)
-    
-    # Get topic ID
     thread_id = getattr(update.effective_message, 'message_thread_id', None)
     
-    status_msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"🚀 <i>Deploying {len(quizzes)} questions...</i>", 
-        parse_mode='HTML',
-        message_thread_id=thread_id
-    )
-    
+    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🚀 <i>Deploying {len(quizzes)} questions...</i>", parse_mode='HTML', message_thread_id=thread_id)
     await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], timer, message_thread_id=thread_id)
     await status_msg.delete()
 
@@ -334,10 +330,7 @@ async def pollquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     quizzes = parse_multiple_quizzes(text)
     settings = await get_user_settings(update.effective_user.id)
-    
-    # Get topic ID
     thread_id = getattr(update.effective_message, 'message_thread_id', None)
-    
     await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], settings['timer'], message_thread_id=thread_id)
 
 async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,10 +339,7 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     quizzes = parse_multiple_quizzes(text)
     settings = await get_user_settings(update.effective_user.id)
-    
-    # Get topic ID
     thread_id = getattr(update.effective_message, 'message_thread_id', None)
-    
     await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], settings['timer'], message_thread_id=thread_id)
 
 def main():
@@ -357,7 +347,6 @@ def main():
 
     TOKEN = os.environ.get("BOT_TOKEN")
     if not TOKEN:
-        print("Error: BOT_TOKEN not set.")
         return
 
     application = Application.builder().token(TOKEN).build()
@@ -367,10 +356,14 @@ def main():
     application.add_handler(CommandHandler("pollquiz", pollquiz_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     
+    # Handlers for DMs
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, save_quiz))
+    application.add_handler(MessageHandler(filters.Document.MimeType("text/plain") & filters.ChatType.PRIVATE, handle_document))
+    
+    # Handlers for Groups
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Ultimate Bot is running with Topic Support...")
+    print("Ultimate Bot is running with File Upload support...")
     application.run_polling()
 
 if __name__ == "__main__":

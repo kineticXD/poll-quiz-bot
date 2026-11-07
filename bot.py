@@ -56,7 +56,6 @@ async def get_user_quizzes(user_id: int):
     return []
 
 async def get_user_settings(user_id: int):
-    """Fetches user settings from DB, creates default if not exists."""
     if settings_collection is not None:
         user = await settings_collection.find_one({"user_id": user_id})
         if not user:
@@ -111,12 +110,17 @@ def parse_multiple_quizzes(text: str):
 
     return parsed_quizzes
 
-async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, anonymous: bool, timer: int):
-    """Sends polls directly to the chat without replying to a message."""
+# --- Poll Sending Logic (NOW WITH TOPIC SUPPORT) ---
+async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, anonymous: bool, timer: int, message_thread_id: int = None):
+    """Sends polls directly to the chat, optionally inside a specific forum topic."""
     for i, quiz in enumerate(quizzes):
         try:
             if len(quiz['question']) > 300:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Question {i+1} is too long (Max 300 chars). Skipped.")
+                await context.bot.send_message(
+                    chat_id=chat_id, 
+                    text=f"⚠️ Question {i+1} is too long (Max 300 chars). Skipped.",
+                    message_thread_id=message_thread_id
+                )
                 continue
                 
             await context.bot.send_poll(
@@ -127,12 +131,17 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
                 correct_option_id=quiz['correct_id'],
                 explanation=quiz['explanation'][:200],
                 is_anonymous=anonymous,
-                open_period=timer if timer >= 5 else None, # Telegram requires timer >= 5s if set
-                protect_content=False 
+                open_period=timer if timer >= 5 else None, 
+                protect_content=False,
+                message_thread_id=message_thread_id # Sends to the correct topic
             )
             await asyncio.sleep(1) 
         except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}")
+            await context.bot.send_message(
+                chat_id=chat_id, 
+                text=f"❌ Error on Q{i+1}: {str(e)}",
+                message_thread_id=message_thread_id
+            )
 
 # --- UI Menus ---
 def get_main_menu():
@@ -211,7 +220,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"🆔 <code>{q['id']}</code> - {first_line}...\n"
             text += "\n💡 <b>To deploy:</b> <code>/quizpoll &lt;ID&gt;</code>"
         
-        # Add a delete button if they have quizzes
         keyboard = []
         if quizzes:
             keyboard.append([InlineKeyboardButton("🗑 Delete a Quiz", callback_data="delete_menu")])
@@ -222,7 +230,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "delete_menu":
         quizzes = await get_user_quizzes(user_id)
         keyboard = []
-        # Create a grid of delete buttons for the first 10 quizzes
         for q in quizzes[:10]:
             keyboard.append([InlineKeyboardButton(f"🗑 {q['id']}", callback_data=f"del_{q['id']}")])
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")])
@@ -281,7 +288,6 @@ async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(success_text, parse_mode='HTML')
     
-    # Preview the first poll using their settings
     settings = await get_user_settings(update.effective_user.id)
     await send_polls(context, update.effective_chat.id, quizzes[:1], settings['anonymous'], settings['timer'])
 
@@ -297,10 +303,8 @@ async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
         return
 
-    # Get user settings
     settings = await get_user_settings(update.effective_user.id)
     
-    # Check if user provided a timer override in the command (e.g. /quizpoll A1B2C3 30)
     timer = settings['timer']
     if len(context.args) > 1:
         try:
@@ -309,10 +313,18 @@ async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     quizzes = parse_multiple_quizzes(saved_data)
-    status_msg = await update.message.reply_text(f"🚀 <i>Deploying {len(quizzes)} questions...</i>", parse_mode='HTML')
     
-    # Send the polls
-    await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], timer)
+    # Get topic ID
+    thread_id = getattr(update.effective_message, 'message_thread_id', None)
+    
+    status_msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"🚀 <i>Deploying {len(quizzes)} questions...</i>", 
+        parse_mode='HTML',
+        message_thread_id=thread_id
+    )
+    
+    await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], timer, message_thread_id=thread_id)
     await status_msg.delete()
 
 async def pollquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -322,7 +334,11 @@ async def pollquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     quizzes = parse_multiple_quizzes(text)
     settings = await get_user_settings(update.effective_user.id)
-    await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], settings['timer'])
+    
+    # Get topic ID
+    thread_id = getattr(update.effective_message, 'message_thread_id', None)
+    
+    await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], settings['timer'], message_thread_id=thread_id)
 
 async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -330,7 +346,11 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     quizzes = parse_multiple_quizzes(text)
     settings = await get_user_settings(update.effective_user.id)
-    await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], settings['timer'])
+    
+    # Get topic ID
+    thread_id = getattr(update.effective_message, 'message_thread_id', None)
+    
+    await send_polls(context, update.effective_chat.id, quizzes, settings['anonymous'], settings['timer'], message_thread_id=thread_id)
 
 def main():
     Thread(target=run_flask, daemon=True).start()
@@ -350,7 +370,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, save_quiz))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Ultimate Bot is running...")
+    print("Ultimate Bot is running with Topic Support...")
     application.run_polling()
 
 if __name__ == "__main__":

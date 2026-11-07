@@ -20,11 +20,18 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- MongoDB Setup ---
+# --- MongoDB Setup (FIXED) ---
 MONGO_URI = os.environ.get("MONGO_URI")
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI) if MONGO_URI else None
-db = client['quiz_bot_db'] if client else None
-quizzes_collection = db['saved_quizzes'] if db else None
+
+if MONGO_URI:
+    client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+    db = client['quiz_bot_db']
+    quizzes_collection = db['saved_quizzes']
+else:
+    print("WARNING: MONGO_URI not found in environment variables.")
+    client = None
+    db = None
+    quizzes_collection = None
 
 async def save_quiz_to_db(quiz_data: str, user_id: int) -> str:
     quiz_id = str(uuid.uuid4())[:6].upper() # Short 6-char ID
@@ -127,7 +134,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I can convert your text into beautiful, forwardable Telegram Quiz Polls.\n\n"
         "👇 <i>Use the buttons below to navigate.</i>"
     )
-    # If it's a callback query (button click), edit the message. Else, reply.
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
@@ -162,8 +168,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "📭 <b>You haven't saved any quizzes yet!</b>\n\nSend me a quiz in our DM to get started."
         else:
             text = f"📚 <b>Your Saved Quizzes ({len(quizzes)})</b>\n\n"
-            for i, q in enumerate(quizzes[:15]): # Show first 15 to avoid huge messages
-                # Get a snippet of the first question
+            for i, q in enumerate(quizzes[:15]): 
                 first_line = q['data'].split('\n')[0][:30]
                 text += f"🆔 <code>{q['id']}</code> - {first_line}...\n"
                 
@@ -176,7 +181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         
     elif query.data == "back":
-        await start(update, context) # Call start again to reset the menu
+        await start(update, context)
 
 async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Triggered when user sends plain text in DM."""
@@ -192,7 +197,6 @@ async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not parse any valid questions. Check your formatting.")
         return
 
-    # Success Message
     success_text = (
         f"✅ <b>Successfully Saved {len(quizzes)} Question(s)!</b>\n\n"
         f"🆔 <b>Quiz ID:</b> <code>{quiz_id}</code>\n"
@@ -200,7 +204,6 @@ async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(success_text, parse_mode='HTML')
     
-    # Preview the first poll immediately
     await send_polls(update.message, quizzes[:1]) 
 
 async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,15 +248,11 @@ def main():
 
     application = Application.builder().token(TOKEN).build()
 
-    # Command Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("quizpoll", quizpoll_command))
     application.add_handler(CommandHandler("pollquiz", pollquiz_command))
-    
-    # Button Click Handler
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    # Message Handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, save_quiz))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 

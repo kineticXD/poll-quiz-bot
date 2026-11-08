@@ -4,6 +4,8 @@ import uuid
 import random
 import asyncio
 import html
+import io
+from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
@@ -88,7 +90,7 @@ async def update_user_setting(user_id: int, key: str, value):
     if settings_collection is not None:
         await settings_collection.update_one({"user_id": user_id}, {"$set": {key: value}})
 
-# --- SMART Quiz Parsing Logic (Keeps Paragraph Breaks) ---
+# --- SMART Quiz Parsing Logic ---
 def parse_multiple_quizzes(text: str):
     lines = text.strip().split('\n')
     quizzes = []
@@ -98,7 +100,6 @@ def parse_multiple_quizzes(text: str):
     for line in lines:
         line = line.strip()
         
-        # Keep blank lines to preserve caselet formatting
         if not line: 
             current_question_lines.append("")
             continue
@@ -131,7 +132,7 @@ def parse_multiple_quizzes(text: str):
         quizzes.append({"question": q_text, "options": current_options, "correct_id": current_correct_id, "explanation": current_explanation or "No explanation provided."})
     return quizzes
 
-# --- Poll Sending Logic (With Flawless Caselet Splitting) ---
+# --- Poll Sending Logic ---
 async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, title: str, settings: dict, timer: int, message_thread_id: int = None):
     intro = f"🎯 <b>{title}</b>\n\nGet ready! <b>{len(quizzes)}</b> questions incoming.\nGood luck! 🍀"
     await context.bot.send_message(chat_id=chat_id, text=intro, parse_mode='HTML', message_thread_id=message_thread_id)
@@ -154,19 +155,16 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
 
                 question_text = quiz['question']
                 
-                # SMART CASELEt SPLITTER
                 if len(question_text) > 300:
                     max_question_len = 290
                     split_idx = -1
                     
-                    # Search backwards for a line break that leaves the question safely under 300 chars
                     for idx in range(len(question_text) - 1, -1, -1):
                         if question_text[idx] == '\n':
                             if len(question_text) - idx <= max_question_len:
                                 split_idx = idx
                                 break
                     
-                    # Fallback if no line break is found
                     if split_idx == -1:
                         split_idx = len(question_text) - 250 
                         
@@ -184,7 +182,6 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
                         
                     question_text = actual_question
 
-                # Hard limit fallback
                 if len(question_text) > 300:
                     question_text = question_text[:295] + "..."
 
@@ -202,7 +199,6 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}", message_thread_id=message_thread_id)
                 success = True
 
-    # Marks Poll (No HTML tags in poll question)
     await asyncio.sleep(2)
     marks_text = "🏆 Quiz Completed!\n\nHow many marks did you get?"
     marks_options = ["0-20% 💀", "21-40% 😕", "41-60% 😐", "61-80% 😃", "81-100% 🔥"]
@@ -213,7 +209,27 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
         message_thread_id=message_thread_id
     )
 
-# --- UI Menus & Handlers ---
+# --- Scheduled Job Callback ---
+async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data
+    
+    chat_id = data['chat_id']
+    quiz_id = data['quiz_id']
+    thread_id = data['thread_id']
+    user_id = data['user_id']
+    timer = data['timer']
+    
+    saved_data, title = await get_quiz_from_db(quiz_id)
+    if not saved_data:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Scheduled Quiz {quiz_id} was deleted before it could run.", message_thread_id=thread_id)
+        return
+
+    settings = await get_user_settings(user_id)
+    quizzes = parse_multiple_quizzes(saved_data)
+    await send_polls(context, chat_id, quizzes, title, settings, timer, message_thread_id=thread_id)
+
+# --- UI Menus ---
 def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("📚 My Quizzes", callback_data="my_quizzes"), InlineKeyboardButton("➕ Create Guide", callback_data="create_guide")],
@@ -242,8 +258,9 @@ def get_timer_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "👋 <b>Welcome to the Premium Quiz Maker!</b>\n\nI turn your text into beautiful, forwardable Telegram Quiz Polls.\n\n💡 <i>Use the buttons below to navigate.</i>"
+    text = "👋 <b>Welcome to the Ultimate Quiz Maker!</b>\n\nI turn your text into beautiful, forwardable Telegram Quiz Polls.\n\n💡 <i>Use the buttons below to navigate.</i>"
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
@@ -265,7 +282,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "c) 5\n"
             "Ex: Basic math</code>\n\n"
             "✅ Mark correct answer with a tick.\n"
-            "🏷 <b>Pro Tip:</b> Use <code>/settitle &lt;ID&gt; &lt;Title&gt;</code> to name your quiz!"
+            "🏷 <b>Pro Tip:</b> Use <code>/settitle &lt;ID&gt; &lt;Title&gt;</code> to name your quiz!\n"
+            "⏰ <b>Schedule:</b> Use <code>/schedule &lt;ID&gt; 15m</code> to post later."
         )
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -280,6 +298,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title = q.get('title', 'Untitled Quiz')
                 text += f"🆔 <code>{q['id']}</code> - <b>{title}</b>\n"
             text += "\n💡 <b>To deploy:</b> <code>/quizpoll &lt;ID&gt;</code>"
+            text += "\n📥 <b>To export:</b> <code>/export &lt;ID&gt;</code>"
         
         keyboard = []
         if quizzes:
@@ -338,7 +357,13 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await update.message.reply_text("❌ Could not parse any valid questions. Check your formatting.")
         return
 
-    success_text = f"✅ <b>Successfully Saved {len(quizzes)} Question(s)!</b>\n\n🆔 <b>Quiz ID:</b> <code>{quiz_id}</code>\n👉 <i>Use <code>/quizpoll {quiz_id}</code> to deploy.</i>\n\n🏷 <b>Name it:</b> <code>/settitle {quiz_id} My Quiz Name</code>"
+    success_text = (
+        f"✅ <b>Successfully Saved {len(quizzes)} Question(s)!</b>\n\n"
+        f"🆔 <b>Quiz ID:</b> <code>{quiz_id}</code>\n"
+        f"👉 <i>Use <code>/quizpoll {quiz_id}</code> to deploy.</i>\n"
+        f"📥 <i>Use <code>/export {quiz_id}</code> to backup.</i>\n\n"
+        f"🏷 <b>Name it:</b> <code>/settitle {quiz_id} Name</code>"
+    )
     await update.message.reply_text(success_text, parse_mode='HTML')
     
     settings = await get_user_settings(update.effective_user.id)
@@ -383,6 +408,88 @@ async def settitle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Title for quiz <code>{quiz_id}</code> updated to:\n<b>{title}</b>", parse_mode='HTML')
     else:
         await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found or you don't own it.", parse_mode='HTML')
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("💡 Usage: <code>/export &lt;ID&gt;</code>", parse_mode='HTML')
+        return
+
+    quiz_id = context.args[0].upper()
+    saved_data, title = await get_quiz_from_db(quiz_id)
+    
+    if not saved_data:
+        await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
+        return
+
+    # Create a text file in memory
+    file_bytes = saved_data.encode('utf-8')
+    file_obj = io.BytesIO(file_bytes)
+    file_obj.name = f"{quiz_id}_{title.replace(' ', '_')}.txt"
+    
+    await update.message.reply_document(
+        document=file_obj,
+        caption=f"📥 Here is your backup for quiz <b>{quiz_id}</b>.\nTitle: <b>{title}</b>",
+        parse_mode='HTML'
+    )
+
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text("💡 Usage: <code>/schedule &lt;ID&gt; &lt;time&gt;</code>\nExample: <code>/schedule A1B2C3 15m</code>", parse_mode='HTML')
+        return
+
+    quiz_id = context.args[0].upper()
+    time_str = context.args[1].lower()
+    
+    # Parse time (e.g., 10m, 2h, 1d)
+    match = re.match(r'^(\d+)([mhd])$', time_str)
+    if not match:
+        await update.message.reply_text("❌ Invalid time format. Use `m` for minutes, `h` for hours, `d` for days (e.g., `15m`).", parse_mode='HTML')
+        return
+        
+    amount = int(match.group(1))
+    unit = match.group(2)
+    
+    if unit == 'm': delay_sec = amount * 60
+    elif unit == 'h': delay_sec = amount * 3600
+    elif unit == 'd': delay_sec = amount * 86400
+    else: delay_sec = 60 # fallback
+
+    if delay_sec < 60:
+         await update.message.reply_text("❌ Minimum schedule time is 1 minute.")
+         return
+
+    saved_data, title = await get_quiz_from_db(quiz_id)
+    if not saved_data:
+        await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
+        return
+
+    settings = await get_user_settings(update.effective_user.id)
+    thread_id = getattr(update.effective_message, 'message_thread_id', None)
+    
+    # Store data for the scheduled job
+    job_data = {
+        "chat_id": update.effective_chat.id,
+        "quiz_id": quiz_id,
+        "thread_id": thread_id,
+        "user_id": update.effective_user.id,
+        "timer": settings['timer']
+    }
+
+    # Add to JobQueue
+    context.job_queue.run_once(scheduled_job, delay_sec, data=job_data, name=f"quiz_{quiz_id}_{update.effective_chat.id}")
+    
+    # Calculate exact time
+    run_time = datetime.now() + timedelta(seconds=delay_sec)
+    time_formatted = run_time.strftime("%I:%M %p")
+
+    await update.message.reply_text(
+        f"✅ <b>Quiz Scheduled!</b>\n\n"
+        f"🆔 <b>ID:</b> <code>{quiz_id}</code>\n"
+        f"🏷 <b>Title:</b> {title}\n"
+        f"⏰ <b>Time:</b> In {time_str} (at {time_formatted})\n\n"
+        f"<i>I will automatically deploy it in this chat.</i>",
+        parse_mode='HTML'
+    )
 
 async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -440,13 +547,15 @@ def main():
     application.add_handler(CommandHandler("settitle", settitle_command))
     application.add_handler(CommandHandler("quizpoll", quizpoll_command))
     application.add_handler(CommandHandler("pollquiz", pollquiz_command))
+    application.add_handler(CommandHandler("export", export_command))
+    application.add_handler(CommandHandler("schedule", schedule_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, save_quiz))
     application.add_handler(MessageHandler(filters.Document.MimeType("text/plain") & filters.ChatType.PRIVATE, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Premium Bot is running with flawless caselet handling...")
+    print("Ultimate Bot is running with Scheduling...")
     application.run_polling()
 
 if __name__ == "__main__":

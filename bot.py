@@ -39,7 +39,7 @@ async def save_quiz_to_db(quiz_data: str, user_id: int) -> str:
             "id": quiz_id, 
             "user_id": user_id, 
             "data": quiz_data,
-            "title": "Untitled Quiz" # Default title
+            "title": "Untitled Quiz"
         })
     return quiz_id
 
@@ -78,7 +78,6 @@ async def get_user_settings(user_id: int):
             default_settings = {"user_id": user_id, "anonymous": False, "timer": 0, "shuffle_q": False, "shuffle_o": False}
             await settings_collection.insert_one(default_settings)
             return default_settings
-        # Add missing keys if upgrading from older version
         if "shuffle_q" not in user: user["shuffle_q"] = False
         if "shuffle_o" not in user: user["shuffle_o"] = False
         return user
@@ -129,15 +128,12 @@ def parse_multiple_quizzes(text: str):
 
 # --- Poll Sending Logic ---
 async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, title: str, settings: dict, timer: int, message_thread_id: int = None):
-    # 1. Send Intro Message
     intro = f"🎯 <b>{title}</b>\n\nGet ready! <b>{len(quizzes)}</b> questions incoming.\nGood luck! 🍀"
     await context.bot.send_message(chat_id=chat_id, text=intro, parse_mode='HTML', message_thread_id=message_thread_id)
 
-    # 2. Apply Shuffling
     if settings.get('shuffle_q', False):
         random.shuffle(quizzes)
 
-    # 3. Send Questions
     for i, quiz in enumerate(quizzes):
         success = False
         while not success:
@@ -145,35 +141,57 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
                 options = quiz['options']
                 correct_id = quiz['correct_id']
 
-                # Handle Option Shuffling carefully
                 if settings.get('shuffle_o', False):
-                    # Create list of tuples (option_text, is_correct)
                     paired = [(opt, idx == correct_id) for idx, opt in enumerate(options)]
                     random.shuffle(paired)
-                    # Unpack back
                     options = [p[0] for p in paired]
                     correct_id = [p[1] for p in paired].index(True)
 
-                if len(quiz['question']) > 300:
-                    await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Question {i+1} too long. Skipped.", message_thread_id=message_thread_id)
-                    success = True
-                    continue
+                question_text = quiz['question']
+                
+                # --- NEW: SMART CASELEt SPLITTER ---
+                # Telegram limits poll questions to 300 chars. If it's longer, split it.
+                if len(question_text) > 300:
+                    # Find a good split point (newline or space around 280 chars)
+                    split_idx = question_text.rfind('\n', 0, 280)
+                    if split_idx == -1:
+                        split_idx = question_text.rfind(' ', 0, 280)
+                    if split_idx == -1:
+                        split_idx = 280
+                        
+                    context_text = question_text[:split_idx].strip()
+                    question_text = question_text[split_idx:].strip()
                     
+                    # Send the Directions/Caselet as a text message first
+                    await context.bot.send_message(
+                        chat_id=chat_id, 
+                        text=f"📖 <b>Directions / Context:</b>\n<i>{context_text}</i>", 
+                        parse_mode='HTML', 
+                        message_thread_id=message_thread_id
+                    )
+                    await asyncio.sleep(1.5) # Brief pause before the poll
+                    
+                    # If the remaining question is STILL too long, we have to skip
+                    if len(question_text) > 300:
+                        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Question {i+1} too long even after splitting. Skipped.", message_thread_id=message_thread_id)
+                        success = True
+                        continue
+
                 await context.bot.send_poll(
-                    chat_id=chat_id, question=quiz['question'], options=options, type=Poll.QUIZ,
+                    chat_id=chat_id, question=question_text, options=options, type=Poll.QUIZ,
                     correct_option_id=correct_id, explanation=quiz['explanation'][:200],
                     is_anonymous=settings['anonymous'], open_period=timer if timer >= 5 else None, 
-                    protect_content=False, message_thread_id=message_thread_id
+                    protect_content=False, message_thread_id=message_thread_id,
+                    parse_mode='HTML' # Added HTML parsing
                 )
                 success = True
-                await asyncio.sleep(3.5) # Safe rate limit
+                await asyncio.sleep(3.5) 
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after + 2)
             except Exception as e:
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}", message_thread_id=message_thread_id)
                 success = True
 
-    # 4. Send Marks Poll at the end
     await asyncio.sleep(2)
     marks_text = "🏆 <b>Quiz Completed!</b>\n\nHow many marks did you get?"
     marks_options = ["0-20% 💀", "21-40% 😕", "41-60% 😐", "61-80% 😃", "81-100% 🔥"]
@@ -181,10 +199,11 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
     await context.bot.send_poll(
         chat_id=chat_id, question=marks_text, options=marks_options, 
         is_anonymous=False, allows_multiple_answers=False, 
-        message_thread_id=message_thread_id
+        message_thread_id=message_thread_id,
+        parse_mode='HTML' # Added HTML parsing here too
     )
 
-# --- UI Menus ---
+# --- UI Menus & Handlers ---
 def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("📚 My Quizzes", callback_data="my_quizzes"), InlineKeyboardButton("➕ Create Guide", callback_data="create_guide")],
@@ -213,7 +232,6 @@ def get_timer_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "👋 <b>Welcome to the Premium Quiz Maker!</b>\n\nI turn your text into beautiful, forwardable Telegram Quiz Polls.\n\n💡 <i>Use the buttons below to navigate.</i>"
     if update.callback_query:
@@ -409,7 +427,7 @@ def main():
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("settitle", settitle_command)) # NEW: Set Title Command
+    application.add_handler(CommandHandler("settitle", settitle_command))
     application.add_handler(CommandHandler("quizpoll", quizpoll_command))
     application.add_handler(CommandHandler("pollquiz", pollquiz_command))
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -418,7 +436,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.MimeType("text/plain") & filters.ChatType.PRIVATE, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Premium Bot is running...")
+    print("Premium Bot is running with Caselet support...")
     application.run_polling()
 
 if __name__ == "__main__":

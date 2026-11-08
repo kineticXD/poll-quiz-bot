@@ -3,6 +3,7 @@ import os
 import uuid
 import random
 import asyncio
+import html
 from threading import Thread
 from flask import Flask
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
@@ -87,7 +88,7 @@ async def update_user_setting(user_id: int, key: str, value):
     if settings_collection is not None:
         await settings_collection.update_one({"user_id": user_id}, {"$set": {key: value}})
 
-# --- SMART Quiz Parsing Logic ---
+# --- SMART Quiz Parsing Logic (Keeps Paragraph Breaks) ---
 def parse_multiple_quizzes(text: str):
     lines = text.strip().split('\n')
     quizzes = []
@@ -96,7 +97,11 @@ def parse_multiple_quizzes(text: str):
 
     for line in lines:
         line = line.strip()
-        if not line: continue
+        
+        # Keep blank lines to preserve caselet formatting
+        if not line: 
+            current_question_lines.append("")
+            continue
             
         if re.match(r'^[a-zA-Z]\)', line):
             if not current_question_lines: continue 
@@ -126,7 +131,7 @@ def parse_multiple_quizzes(text: str):
         quizzes.append({"question": q_text, "options": current_options, "correct_id": current_correct_id, "explanation": current_explanation or "No explanation provided."})
     return quizzes
 
-# --- Poll Sending Logic ---
+# --- Poll Sending Logic (With Flawless Caselet Splitting) ---
 async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, title: str, settings: dict, timer: int, message_thread_id: int = None):
     intro = f"🎯 <b>{title}</b>\n\nGet ready! <b>{len(quizzes)}</b> questions incoming.\nGood luck! 🍀"
     await context.bot.send_message(chat_id=chat_id, text=intro, parse_mode='HTML', message_thread_id=message_thread_id)
@@ -149,40 +154,45 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
 
                 question_text = quiz['question']
                 
-                # --- NEW: SMART CASELEt SPLITTER ---
-                # Telegram limits poll questions to 300 chars. If it's longer, split it.
+                # SMART CASELEt SPLITTER
                 if len(question_text) > 300:
-                    # Find a good split point (newline or space around 280 chars)
-                    split_idx = question_text.rfind('\n', 0, 280)
+                    max_question_len = 290
+                    split_idx = -1
+                    
+                    # Search backwards for a line break that leaves the question safely under 300 chars
+                    for idx in range(len(question_text) - 1, -1, -1):
+                        if question_text[idx] == '\n':
+                            if len(question_text) - idx <= max_question_len:
+                                split_idx = idx
+                                break
+                    
+                    # Fallback if no line break is found
                     if split_idx == -1:
-                        split_idx = question_text.rfind(' ', 0, 280)
-                    if split_idx == -1:
-                        split_idx = 280
+                        split_idx = len(question_text) - 250 
                         
-                    context_text = question_text[:split_idx].strip()
-                    question_text = question_text[split_idx:].strip()
+                    context_text = html.escape(question_text[:split_idx].strip())
+                    actual_question = question_text[split_idx:].strip()
                     
-                    # Send the Directions/Caselet as a text message first
-                    await context.bot.send_message(
-                        chat_id=chat_id, 
-                        text=f"📖 <b>Directions / Context:</b>\n<i>{context_text}</i>", 
-                        parse_mode='HTML', 
-                        message_thread_id=message_thread_id
-                    )
-                    await asyncio.sleep(1.5) # Brief pause before the poll
-                    
-                    # If the remaining question is STILL too long, we have to skip
-                    if len(question_text) > 300:
-                        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Question {i+1} too long even after splitting. Skipped.", message_thread_id=message_thread_id)
-                        success = True
-                        continue
+                    if context_text:
+                        await context.bot.send_message(
+                            chat_id=chat_id, 
+                            text=f"📖 <b>Directions / Context:</b>\n<i>{context_text}</i>", 
+                            parse_mode='HTML', 
+                            message_thread_id=message_thread_id
+                        )
+                        await asyncio.sleep(1.5)
+                        
+                    question_text = actual_question
+
+                # Hard limit fallback
+                if len(question_text) > 300:
+                    question_text = question_text[:295] + "..."
 
                 await context.bot.send_poll(
                     chat_id=chat_id, question=question_text, options=options, type=Poll.QUIZ,
                     correct_option_id=correct_id, explanation=quiz['explanation'][:200],
                     is_anonymous=settings['anonymous'], open_period=timer if timer >= 5 else None, 
-                    protect_content=False, message_thread_id=message_thread_id,
-                    parse_mode='HTML' # Added HTML parsing
+                    protect_content=False, message_thread_id=message_thread_id
                 )
                 success = True
                 await asyncio.sleep(3.5) 
@@ -192,15 +202,15 @@ async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: 
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}", message_thread_id=message_thread_id)
                 success = True
 
+    # Marks Poll (No HTML tags in poll question)
     await asyncio.sleep(2)
-    marks_text = "🏆 <b>Quiz Completed!</b>\n\nHow many marks did you get?"
+    marks_text = "🏆 Quiz Completed!\n\nHow many marks did you get?"
     marks_options = ["0-20% 💀", "21-40% 😕", "41-60% 😐", "61-80% 😃", "81-100% 🔥"]
     
     await context.bot.send_poll(
         chat_id=chat_id, question=marks_text, options=marks_options, 
         is_anonymous=False, allows_multiple_answers=False, 
-        message_thread_id=message_thread_id,
-        parse_mode='HTML' # Added HTML parsing here too
+        message_thread_id=message_thread_id
     )
 
 # --- UI Menus & Handlers ---
@@ -436,7 +446,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.MimeType("text/plain") & filters.ChatType.PRIVATE, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Premium Bot is running with Caselet support...")
+    print("Premium Bot is running with flawless caselet handling...")
     application.run_polling()
 
 if __name__ == "__main__":

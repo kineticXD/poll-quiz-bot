@@ -433,6 +433,10 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.job_queue is None:
+        await update.message.reply_text("❌ Scheduling is not available.")
+        return
+        
     if len(context.args) != 2:
         await update.message.reply_text("💡 Usage: <code>/schedule &lt;ID&gt; &lt;time&gt;</code>\nExample: <code>/schedule A1B2C3 15m</code>", parse_mode='HTML')
         return
@@ -440,7 +444,6 @@ async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_id = context.args[0].upper()
     time_str = context.args[1].lower()
     
-    # Parse time (e.g., 10m, 2h, 1d)
     match = re.match(r'^(\d+)([mhd])$', time_str)
     if not match:
         await update.message.reply_text("❌ Invalid time format. Use `m` for minutes, `h` for hours, `d` for days (e.g., `15m`).", parse_mode='HTML')
@@ -452,7 +455,7 @@ async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if unit == 'm': delay_sec = amount * 60
     elif unit == 'h': delay_sec = amount * 3600
     elif unit == 'd': delay_sec = amount * 86400
-    else: delay_sec = 60 # fallback
+    else: delay_sec = 60 
 
     if delay_sec < 60:
          await update.message.reply_text("❌ Minimum schedule time is 1 minute.")
@@ -466,7 +469,6 @@ async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await get_user_settings(update.effective_user.id)
     thread_id = getattr(update.effective_message, 'message_thread_id', None)
     
-    # Store data for the scheduled job
     job_data = {
         "chat_id": update.effective_chat.id,
         "quiz_id": quiz_id,
@@ -475,10 +477,8 @@ async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "timer": settings['timer']
     }
 
-    # Add to JobQueue
     context.job_queue.run_once(scheduled_job, delay_sec, data=job_data, name=f"quiz_{quiz_id}_{update.effective_chat.id}")
     
-    # Calculate exact time
     run_time = datetime.now() + timedelta(seconds=delay_sec)
     time_formatted = run_time.strftime("%I:%M %p")
 
@@ -490,6 +490,58 @@ async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>I will automatically deploy it in this chat.</i>",
         parse_mode='HTML'
     )
+
+async def cancelschedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.job_queue is None:
+        await update.message.reply_text("❌ Scheduling is not available.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("💡 Usage: <code>/cancelschedule &lt;ID&gt;</code>", parse_mode='HTML')
+        return
+
+    quiz_id = context.args[0].upper()
+    chat_id = update.effective_chat.id
+    target_name = f"quiz_{quiz_id}_{chat_id}"
+    
+    job_to_cancel = None
+    for job in context.job_queue.jobs():
+        if job.name == target_name:
+            job_to_cancel = job
+            break
+            
+    if job_to_cancel:
+        job_to_cancel.schedule_removal()
+        await update.message.reply_text(
+            f"✅ <b>Cancelled!</b>\n\nThe scheduled deployment for quiz <code>{quiz_id}</code> has been successfully removed.", 
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ No active schedule found for quiz <code>{quiz_id}</code> in this chat.", 
+            parse_mode='HTML'
+        )
+
+async def myschedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.job_queue is None:
+        return
+        
+    chat_id = update.effective_chat.id
+    active_jobs = [job for job in context.job_queue.jobs() if job.data and job.data.get("chat_id") == chat_id]
+    
+    if not active_jobs:
+        await update.message.reply_text("📭 <b>No schedules found.</b>\n\nThere are no quizzes scheduled for this chat right now.", parse_mode='HTML')
+        return
+        
+    text = "⏰ <b>Active Scheduled Quizzes:</b>\n\n"
+    for job in active_jobs:
+        quiz_id = job.data.get("quiz_id", "Unknown")
+        time_left = job.next_t - datetime.now(job.next_t.tzinfo)
+        mins, secs = divmod(int(time_left.total_seconds()), 60)
+        text += f"🆔 <code>{quiz_id}</code> - Starts in <b>{mins}m {secs}s</b>\n"
+        
+    text += "\n💡 <i>To cancel, use:</i> <code>/cancelschedule &lt;ID&gt;</code>"
+    await update.message.reply_text(text, parse_mode='HTML')
 
 async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -549,6 +601,8 @@ def main():
     application.add_handler(CommandHandler("pollquiz", pollquiz_command))
     application.add_handler(CommandHandler("export", export_command))
     application.add_handler(CommandHandler("schedule", schedule_command))
+    application.add_handler(CommandHandler("cancelschedule", cancelschedule_command))
+    application.add_handler(CommandHandler("myschedules", myschedules_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, save_quiz))

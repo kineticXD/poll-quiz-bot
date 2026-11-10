@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import difflib
+import html as html_lib
 from typing import Any
 
 import httpx
@@ -64,16 +65,63 @@ def _resolve_answer(answer_text: str, options: list[str]) -> int | None:
     return None
 
 
-def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], str]:
-    """Parse common MCQ layouts, retaining shared passage/context.
+def _normalize_import_text(text: str) -> list[str]:
+    """Normalize copied chat/document text without discarding meaningful lines."""
+    text = html_lib.unescape(str(text or ""))
+    text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Some sources encode a hard line break as a trailing backslash.
+    text = re.sub(r"\\[ \t]*\n", "\n", text)
+    lines = []
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        # A trailing slash at end-of-input is also a copied hard-break marker.
+        if line.endswith("\\"):
+            line = line[:-1].rstrip()
+        # Remove common Markdown emphasis while preserving the words themselves.
+        line = re.sub(r"\*\*(.*?)\*\*", r"\1", line)
+        line = re.sub(r"__(.*?)__", r"\1", line)
+        lines.append(_clean_line(line))
+    return lines
 
-    Returns (questions, warnings, leading_context). Questions are returned only
-    when they have 2-10 options and an unambiguous correct answer.
+
+DIRECTIONS_RE = re.compile(
+    r"^\s*directions?\s*(?:\(\s*(?P<first>\d{1,3})\s*[-–—]\s*(?P<last>\d{1,3})\s*\))?\s*:\s*(?P<body>.*)$",
+    re.I,
+)
+QUESTION_START_RE = re.compile(
+    r"^(?:what|which|who|whom|whose|when|where|why|how|if|after|before|assuming|calculate|compute|find|identify|select|choose|determine|state|give|in how many|to what extent|under what)\b",
+    re.I,
+)
+
+
+def _is_question_stem(line: str, has_context: bool = False) -> bool:
+    candidate = line.strip()
+    if not candidate:
+        return False
+    if QUESTION_MARKER_RE.match(candidate):
+        return True
+    # In an MCQ block, a complete question mark is a reliable boundary even
+    # when the stem starts with a conditional ("If P leaves, ...?").
+    if "?" in candidate:
+        return True
+    if QUESTION_START_RE.match(candidate):
+        return True
+    # Support exam-style imperative stems without a question mark.
+    return bool(re.match(r"^(?:calculate|compute|find|identify|select|choose|determine)\b", candidate, re.I))
+
+
+def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], str]:
+    """Parse MCQs and keep each shared Directions/passage block with its questions.
+
+    Supports unnumbered question stems, Q1/1. stems, check-marked options,
+    answer keys, multi-line explanations, and repeated Directions (01-05)
+    sections. Returns (valid_questions, warnings, combined_context).
     """
-    lines = [_clean_line(x) for x in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = _normalize_import_text(text)
     result: list[dict[str, Any]] = []
     warnings: list[str] = []
-    leading_context_lines: list[str] = []
+    context_lines: list[str] = []
     q_lines: list[str] = []
     options: list[str] = []
     marked_correct: list[int] = []
@@ -81,13 +129,32 @@ def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], s
     explanation_lines: list[str] = []
     in_explanation = False
     question_context = ""
-    seen_question = False
+    question_started = False
+    section_expected: int | None = None
+    section_seen = 0
+    section_name = ""
+    all_contexts: list[str] = []
+
+    def check_section_count() -> None:
+        full_context = "\n".join(x for x in context_lines if x.strip()).strip()
+        if full_context and full_context not in all_contexts:
+            all_contexts.append(full_context)
+        if section_expected is not None and section_seen != section_expected:
+            label = section_name or "Directions section"
+            warnings.append(
+                f"{label}: expected {section_expected} questions from its number range, "
+                f"but detected {section_seen}. Check the imported text for a missing or malformed question."
+            )
 
     def finish() -> None:
-        nonlocal q_lines, options, marked_correct, answer_hint, explanation_lines, in_explanation, question_context
+        nonlocal q_lines, options, marked_correct, answer_hint
+        nonlocal explanation_lines, in_explanation, question_context
+        nonlocal question_started, section_seen
         question = "\n".join(x for x in q_lines if x.strip()).strip()
         if not question and not options:
             return
+        if question:
+            section_seen += 1
         if not question:
             warnings.append("Found answer options without a question stem.")
         elif len(options) < 2:
@@ -110,23 +177,38 @@ def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], s
                         correct_id = hinted
             if correct_id is None:
                 warnings.append(f"Skipped '{question[:55]}': no clear correct answer was marked.")
+            elif len({re.sub(r"\s+", " ", o).casefold() for o in options}) != len(options):
+                warnings.append(f"Skipped '{question[:55]}': duplicate answer options were found.")
             else:
-                if len({re.sub(r"\s+", " ", o).casefold() for o in options}) != len(options):
-                    warnings.append(f"Skipped '{question[:55]}': duplicate answer options were found.")
-                else:
-                    explanation = " ".join(x.strip() for x in explanation_lines if x.strip()).strip()
-                    result.append({
-                        "question": question,
-                        "options": options[:],
-                        "correct_id": correct_id,
-                        "explanation": explanation or "Review the passage and compare each option with the stated facts.",
-                        "context": question_context.strip(),
-                    })
+                explanation = " ".join(x.strip() for x in explanation_lines if x.strip()).strip()
+                context = "\n".join(x for x in context_lines if x.strip()).strip()
+                result.append({
+                    "question": question,
+                    "options": options[:],
+                    "correct_id": correct_id,
+                    "explanation": explanation or "Review the passage and compare each option with the stated facts.",
+                    "context": context,
+                })
         q_lines, options, marked_correct = [], [], []
         answer_hint = None
         explanation_lines = []
         in_explanation = False
         question_context = ""
+        question_started = False
+
+    def begin_new_section(line: str, match: re.Match[str]) -> None:
+        nonlocal context_lines, section_expected, section_seen, section_name
+        if options or q_lines:
+            finish()
+        check_section_count()
+        first = match.group("first")
+        last = match.group("last")
+        section_expected = (int(last) - int(first) + 1) if first and last and int(last) >= int(first) else None
+        section_seen = 0
+        section_name = f"Directions ({first}-{last})" if first and last else "Directions section"
+        body = (match.group("body") or "").strip()
+        cleaned_heading = f"Directions ({first}-{last}):" if first and last else "Directions:"
+        context_lines = [cleaned_heading + (f" {body}" if body else "")]
 
     for raw in lines:
         line = raw.strip()
@@ -135,6 +217,11 @@ def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], s
                 explanation_lines.append("")
             elif q_lines and not options:
                 q_lines.append("")
+            continue
+
+        direction_match = DIRECTIONS_RE.match(line)
+        if direction_match:
+            begin_new_section(line, direction_match)
             continue
 
         # Metadata after options: answer key and explanation may occur in either order.
@@ -148,40 +235,34 @@ def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], s
             explanation_lines.append(em.group(1).strip())
             in_explanation = True
             continue
-        if options and in_explanation and not OPTION_RE.match(line):
-            # Explanation is allowed to span multiple lines. A numbered next stem ends it.
-            if QUESTION_MARKER_RE.match(line) or ("?" in line and not line.lower().startswith(("e.g.", "i.e."))):
-                finish()
-            else:
-                explanation_lines.append(line)
-                continue
 
-        # A new explicit question marker starts a block. Keep preceding prose as shared context.
+        # Explicitly numbered question blocks.
         q_marker = QUESTION_MARKER_RE.match(line)
         if q_marker:
             if options:
                 finish()
             elif q_lines:
-                prior = "\n".join(q_lines).strip()
-                if not seen_question and len(prior) > 50:
-                    leading_context_lines.append(prior)
-                elif prior:
-                    warnings.append(f"Ignored incomplete question text: {prior[:60]}")
+                # Text before the first question marker is shared passage/context.
+                if not question_started:
+                    context_lines.extend(x for x in q_lines if x.strip())
+                else:
+                    warnings.append(f"Ignored incomplete question text: {' '.join(q_lines)[:60]}")
                 q_lines = []
-            seen_question = True
-            question_context = "\n".join(leading_context_lines).strip()
             stripped = QUESTION_MARKER_RE.sub("", line, count=1).strip()
             if stripped:
                 q_lines.append(stripped)
+            question_context = "\n".join(context_lines).strip()
+            question_started = True
             continue
 
         option_match = OPTION_RE.match(line)
         if option_match:
             if not q_lines and not options:
-                # An option without a stem is not a new question.
+                # A labelled list before the first question is passage content,
+                # not an MCQ option block.
+                context_lines.append(line)
                 continue
-            if in_explanation:
-                in_explanation = False
+            in_explanation = False
             raw_option = option_match.group(4).strip()
             clean_option, marked = _strip_marker(raw_option)
             if clean_option:
@@ -190,39 +271,44 @@ def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], s
                     marked_correct.append(len(options) - 1)
             continue
 
-        # A fresh unnumbered question after options usually ends in a question mark.
-        if options and ("?" in line or re.match(r"^(?:what|which|who|when|where|why|how|identify|select|choose)\b", line, re.I)):
-            finish()
-            seen_question = True
-            q_lines.append(line)
-            question_context = "\n".join(leading_context_lines).strip()
-            continue
-
         if options:
+            # A new question begins only after the prior option set is complete.
+            if ("?" in line or _is_question_stem(line)) and not in_explanation:
+                finish()
+                q_lines.append(line)
+                question_context = "\n".join(context_lines).strip()
+                question_started = True
+                continue
             if in_explanation:
                 explanation_lines.append(line)
             else:
-                # Keep continuation of a wrapped option when it immediately follows options.
+                # Multi-line option labels are kept attached to the last option.
                 if options:
                     options[-1] = f"{options[-1]} {line}".strip()
-                else:
-                    q_lines.append(line)
-        else:
-            if not seen_question and not QUESTION_MARKER_RE.match(line):
-                # This will be assigned as leading passage if an explicit question follows.
+            continue
+
+        if not question_started:
+            if _is_question_stem(line, has_context=bool(context_lines)):
                 q_lines.append(line)
+                question_context = "\n".join(context_lines).strip()
+                question_started = True
             else:
-                q_lines.append(line)
+                # Directions and supporting passage text are accumulated until
+                # the first question, then retained for the whole section.
+                context_lines.append(line)
+        else:
+            # Wrapped question stems continue until the first option line.
+            q_lines.append(line)
 
     if options or q_lines:
-        # Preserve a final text block as passage context when it never formed a question.
-        if not options and not seen_question and q_lines:
-            leading_context_lines.append("\n".join(q_lines).strip())
-        else:
+        if options or question_started:
             finish()
+        elif q_lines:
+            context_lines.extend(q_lines)
 
-    leading_context = "\n".join(x for x in leading_context_lines if x).strip()
-    return result, warnings, leading_context
+    check_section_count()
+    combined_context = "\n\n".join(x for x in all_contexts if x).strip()
+    return result, warnings, combined_context
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -555,7 +641,14 @@ def create_quiz_from_text(text: str) -> tuple[list[dict[str, Any]], list[str], s
 
 def questions_to_text(questions: list[dict[str, Any]]) -> str:
     lines: list[str] = []
+    previous_context: str | None = None
     for index, item in enumerate(questions, 1):
+        current_context = str(item.get("context", "")).strip()
+        if current_context and current_context != previous_context:
+            if lines:
+                lines.append("")
+            lines.extend([current_context, ""])
+        previous_context = current_context
         lines.append(f"{index}. {item['question']}")
         for option_index, option in enumerate(item["options"]):
             marker = " ✅" if option_index == item["correct_id"] else ""
@@ -564,3 +657,4 @@ def questions_to_text(questions: list[dict[str, Any]]) -> str:
             lines.append(f"Explanation: {item['explanation']}")
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+

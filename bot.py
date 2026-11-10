@@ -1,616 +1,1051 @@
-import re
-import os
-import uuid
-import random
+"""Premium Telegram Poll Quiz Bot.
+
+Features: paragraph-to-quiz generation (AI optional), robust MCQ parsing,
+inline dashboard, personal quiz library, export, group publishing and
+persistent scheduled publishing.
+"""
+from __future__ import annotations
+
 import asyncio
 import html
 import io
-from datetime import datetime, timedelta
+import logging
+import os
+import re
+import time
+import uuid
+from datetime import datetime, timezone
 from threading import Thread
-from flask import Flask
+from typing import Any
+
+from flask import Flask, jsonify
+from dotenv import load_dotenv
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from telegram.error import RetryAfter
-import motor.motor_asyncio
+from telegram.constants import ChatType, ParseMode
+from telegram.error import RetryAfter, TelegramError
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
+)
+from pypdf import PdfReader
+from docx import Document
 
-# --- Keep Alive Server ---
-app = Flask(__name__)
+from quiz_engine import (
+    create_quiz_from_text, generate_with_ai, parse_structured_quiz,
+    questions_to_text,
+)
+from storage import Storage
 
-@app.route('/')
+# ---------------------------------------------------------------------------
+# Configuration and health endpoint
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("poll-quiz-bot")
+load_dotenv()
+
+web_app = Flask(__name__)
+storage = Storage()
+
+
+@web_app.get("/")
 def home():
-    return "Premium Quiz Bot is alive!"
+    return "Poll Quiz Bot is running. Open Telegram and use /start."
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
 
-# --- MongoDB Setup ---
-MONGO_URI = os.environ.get("MONGO_URI")
-if MONGO_URI:
-    client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-    db = client['quiz_bot_db']
-    quizzes_collection = db['saved_quizzes']
-    settings_collection = db['user_settings']
-else:
-    client = db = quizzes_collection = settings_collection = None
+@web_app.get("/healthz")
+def health():
+    return jsonify({"status": "ok", "service": "poll-quiz-bot"}), 200
 
-# --- Database Functions ---
-async def save_quiz_to_db(quiz_data: str, user_id: int) -> str:
-    quiz_id = str(uuid.uuid4())[:6].upper()
-    if quizzes_collection is not None:
-        await quizzes_collection.insert_one({
-            "id": quiz_id, 
-            "user_id": user_id, 
-            "data": quiz_data,
-            "title": "Untitled Quiz"
-        })
-    return quiz_id
 
-async def get_quiz_from_db(quiz_id: str):
-    if quizzes_collection is not None:
-        result = await quizzes_collection.find_one({"id": quiz_id})
-        if result:
-            return result.get("data"), result.get("title", "Untitled Quiz")
-    return None, None
+def run_web_server() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-async def set_quiz_title(quiz_id: str, title: str, user_id: int) -> bool:
-    if quizzes_collection is not None:
-        result = await quizzes_collection.update_one(
-            {"id": quiz_id, "user_id": user_id},
-            {"$set": {"title": title}}
-        )
-        return result.modified_count > 0
-    return False
 
-async def delete_quiz_from_db(quiz_id: str, user_id: int) -> bool:
-    if quizzes_collection is not None:
-        result = await quizzes_collection.delete_one({"id": quiz_id, "user_id": user_id})
-        return result.deleted_count > 0
-    return False
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧠 Create from paragraph", callback_data="create_paragraph")],
+        [InlineKeyboardButton("📝 Import MCQ format", callback_data="create_mcq"), InlineKeyboardButton("📚 My library", callback_data="library")],
+        [InlineKeyboardButton("🚀 Publish in a group", callback_data="group_help"), InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("📖 Help & examples", callback_data="help"), InlineKeyboardButton("ℹ️ About", callback_data="about")],
+    ])
 
-async def get_user_quizzes(user_id: int):
-    if quizzes_collection is not None:
-        cursor = quizzes_collection.find({"user_id": user_id})
-        return await cursor.to_list(length=100)
-    return []
 
-async def get_user_settings(user_id: int):
-    if settings_collection is not None:
-        user = await settings_collection.find_one({"user_id": user_id})
-        if not user:
-            default_settings = {"user_id": user_id, "anonymous": False, "timer": 0, "shuffle_q": False, "shuffle_o": False}
-            await settings_collection.insert_one(default_settings)
-            return default_settings
-        if "shuffle_q" not in user: user["shuffle_q"] = False
-        if "shuffle_o" not in user: user["shuffle_o"] = False
-        return user
-    return {"anonymous": False, "timer": 0, "shuffle_q": False, "shuffle_o": False}
+def back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Main menu", callback_data="home")]])
 
-async def update_user_setting(user_id: int, key: str, value):
-    if settings_collection is not None:
-        await settings_collection.update_one({"user_id": user_id}, {"$set": {key: value}})
 
-# --- SMART Quiz Parsing Logic ---
-def parse_multiple_quizzes(text: str):
-    lines = text.strip().split('\n')
-    quizzes = []
-    current_question_lines, current_options = [], []
-    current_correct_id, current_explanation = 0, ""
+def settings_menu(settings: dict[str, Any]) -> InlineKeyboardMarkup:
+    def state(key: str) -> str:
+        return "ON ✅" if settings.get(key) else "OFF ❌"
+    timer = int(settings.get("timer", 0) or 0)
+    timer_text = "Off" if timer == 0 else f"{timer}s"
+    count = int(settings.get("question_count", 10) or 10)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🕵️ Anonymous polls: {state('anonymous')}", callback_data="toggle_anonymous")],
+        [InlineKeyboardButton(f"🎲 Shuffle questions: {state('shuffle_q')}", callback_data="toggle_shuffle_q")],
+        [InlineKeyboardButton(f"🔀 Shuffle options: {state('shuffle_o')}", callback_data="toggle_shuffle_o")],
+        [InlineKeyboardButton(f"⏱ Poll timer: {timer_text}", callback_data="timer_menu")],
+        [InlineKeyboardButton(f"🔢 Paragraph question count: {count}", callback_data="count_menu")],
+        [InlineKeyboardButton("↩️ Main menu", callback_data="home")],
+    ])
 
-    for line in lines:
-        line = line.strip()
-        
-        if not line: 
-            current_question_lines.append("")
-            continue
-            
-        if re.match(r'^[a-zA-Z]\)', line):
-            if not current_question_lines: continue 
-            option_text = re.sub(r'^[a-zA-Z]\)\s*', '', line)
-            if '✅' in option_text or '✔️' in option_text:
-                current_correct_id = len(current_options)
-                option_text = option_text.replace('✅', '').replace('✔️', '').strip()
-            current_options.append(option_text)
-            
-        elif line.lower().startswith('explanation:') or line.lower().startswith('ex:'):
-            if current_question_lines:
-                current_explanation = re.sub(r'^(explanation|ex):\s*', '', line, flags=re.IGNORECASE).strip()
-        else:
-            if current_options:
-                q_text = "\n".join(current_question_lines).strip()
-                if q_text and 2 <= len(current_options) <= 10 and current_correct_id < len(current_options):
-                    quizzes.append({"question": q_text, "options": current_options, "correct_id": current_correct_id, "explanation": current_explanation or "No explanation provided."})
-                current_question_lines = [line]
-                current_options = []
-                current_correct_id = 0
-                current_explanation = ""
-            else:
-                current_question_lines.append(line)
 
-    q_text = "\n".join(current_question_lines).strip()
-    if q_text and 2 <= len(current_options) <= 10 and current_correct_id < len(current_options):
-        quizzes.append({"question": q_text, "options": current_options, "correct_id": current_correct_id, "explanation": current_explanation or "No explanation provided."})
-    return quizzes
+def timer_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Off", callback_data="timer_0"), InlineKeyboardButton("10 sec", callback_data="timer_10"), InlineKeyboardButton("30 sec", callback_data="timer_30")],
+        [InlineKeyboardButton("1 min", callback_data="timer_60"), InlineKeyboardButton("3 min", callback_data="timer_180"), InlineKeyboardButton("5 min", callback_data="timer_300")],
+        [InlineKeyboardButton("10 min", callback_data="timer_600")],
+        [InlineKeyboardButton("↩️ Settings", callback_data="settings")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
-# --- Poll Sending Logic ---
-async def send_polls(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quizzes: list, title: str, settings: dict, timer: int, message_thread_id: int = None):
-    intro = f"🎯 <b>{title}</b>\n\nGet ready! <b>{len(quizzes)}</b> questions incoming.\nGood luck! 🍀"
-    await context.bot.send_message(chat_id=chat_id, text=intro, parse_mode='HTML', message_thread_id=message_thread_id)
 
-    if settings.get('shuffle_q', False):
-        random.shuffle(quizzes)
+def count_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("5", callback_data="count_5"), InlineKeyboardButton("10", callback_data="count_10"), InlineKeyboardButton("15", callback_data="count_15"), InlineKeyboardButton("20", callback_data="count_20")],
+        [InlineKeyboardButton("↩️ Settings", callback_data="settings")],
+    ])
 
-    for i, quiz in enumerate(quizzes):
-        success = False
-        while not success:
-            try:
-                options = quiz['options']
-                correct_id = quiz['correct_id']
 
-                if settings.get('shuffle_o', False):
-                    paired = [(opt, idx == correct_id) for idx, opt in enumerate(options)]
-                    random.shuffle(paired)
-                    options = [p[0] for p in paired]
-                    correct_id = [p[1] for p in paired].index(True)
+def quiz_action_menu(quiz_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Publish here", callback_data=f"publish:{quiz_id}"), InlineKeyboardButton("👁 Preview", callback_data=f"preview:{quiz_id}")],
+        [InlineKeyboardButton("📤 Export", callback_data=f"export:{quiz_id}"), InlineKeyboardButton("✏️ Rename", callback_data=f"rename:{quiz_id}")],
+        [InlineKeyboardButton("🗑 Delete quiz", callback_data=f"delete:{quiz_id}")],
+        [InlineKeyboardButton("📚 My library", callback_data="library")],
+    ])
 
-                question_text = quiz['question']
-                
-                if len(question_text) > 300:
-                    max_question_len = 290
-                    split_idx = -1
-                    
-                    for idx in range(len(question_text) - 1, -1, -1):
-                        if question_text[idx] == '\n':
-                            if len(question_text) - idx <= max_question_len:
-                                split_idx = idx
-                                break
-                    
-                    if split_idx == -1:
-                        split_idx = len(question_text) - 250 
-                        
-                    context_text = html.escape(question_text[:split_idx].strip())
-                    actual_question = question_text[split_idx:].strip()
-                    
-                    if context_text:
-                        await context.bot.send_message(
-                            chat_id=chat_id, 
-                            text=f"📖 <b>Directions / Context:</b>\n<i>{context_text}</i>", 
-                            parse_mode='HTML', 
-                            message_thread_id=message_thread_id
-                        )
-                        await asyncio.sleep(1.5)
-                        
-                    question_text = actual_question
 
-                if len(question_text) > 300:
-                    question_text = question_text[:295] + "..."
+def _safe_title(value: str) -> str:
+    return html.escape(value or "Untitled Quiz")
 
-                await context.bot.send_poll(
-                    chat_id=chat_id, question=question_text, options=options, type=Poll.QUIZ,
-                    correct_option_id=correct_id, explanation=quiz['explanation'][:200],
-                    is_anonymous=settings['anonymous'], open_period=timer if timer >= 5 else None, 
-                    protect_content=False, message_thread_id=message_thread_id
-                )
-                success = True
-                await asyncio.sleep(3.5) 
-            except RetryAfter as e:
-                await asyncio.sleep(e.retry_after + 2)
-            except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error on Q{i+1}: {str(e)}", message_thread_id=message_thread_id)
-                success = True
 
-    await asyncio.sleep(2)
-    marks_text = "🏆 Quiz Completed!\n\nHow many marks did you get?"
-    marks_options = ["0-20% 💀", "21-40% 😕", "41-60% 😐", "61-80% 😃", "81-100% 🔥"]
-    
-    await context.bot.send_poll(
-        chat_id=chat_id, question=marks_text, options=marks_options, 
-        is_anonymous=False, allows_multiple_answers=False, 
-        message_thread_id=message_thread_id
+def _get_ai_config() -> tuple[str, str, str]:
+    return (
+        os.getenv("AI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip(),
+        os.getenv("AI_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).strip(),
+        os.getenv("AI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip(),
     )
 
-# --- Scheduled Job Callback ---
-async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    data = job.data
-    
-    chat_id = data['chat_id']
-    quiz_id = data['quiz_id']
-    thread_id = data['thread_id']
-    user_id = data['user_id']
-    timer = data['timer']
-    
-    saved_data, title = await get_quiz_from_db(quiz_id)
-    if not saved_data:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Scheduled Quiz {quiz_id} was deleted before it could run.", message_thread_id=thread_id)
+
+# ---------------------------------------------------------------------------
+# Quiz validation, storage and paragraph pipeline
+# ---------------------------------------------------------------------------
+def _validate_questions(questions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    valid: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for idx, source in enumerate(questions, 1):
+        q = dict(source)
+        question = str(q.get("question", "")).strip()
+        options = q.get("options", [])
+        correct_id = q.get("correct_id")
+        if not question:
+            errors.append(f"Question {idx}: empty question.")
+            continue
+        if len(question) > 300:
+            errors.append(f"Question {idx}: exceeds Telegram's 300-character limit.")
+            continue
+        if not isinstance(options, list) or not 2 <= len(options) <= 10:
+            errors.append(f"Question {idx}: must have 2 to 10 options.")
+            continue
+        options = [str(option).strip() for option in options]
+        if any(not option or len(option) > 100 for option in options):
+            errors.append(f"Question {idx}: an option is empty or exceeds 100 characters.")
+            continue
+        if len({re.sub(r"\s+", " ", x).casefold() for x in options}) != len(options):
+            errors.append(f"Question {idx}: duplicate options.")
+            continue
+        try:
+            correct_id = int(correct_id)
+        except (TypeError, ValueError):
+            errors.append(f"Question {idx}: correct answer is missing.")
+            continue
+        if not 0 <= correct_id < len(options):
+            errors.append(f"Question {idx}: answer key is outside the options.")
+            continue
+        explanation = str(q.get("explanation", "")).strip() or "Compare each option with the facts in the source."
+        valid.append({
+            "question": question,
+            "options": options,
+            "correct_id": correct_id,
+            "explanation": explanation[:200],
+            "context": str(q.get("context", "")).strip(),
+            **({"evidence": str(q["evidence"])} if q.get("evidence") else {}),
+        })
+    return valid, errors
+
+
+async def build_quiz(text: str, user_id: int, settings: dict[str, Any]) -> tuple[list[dict[str, Any]], str, str, list[str]]:
+    """Prefer structured parsing, then AI, then cautious offline extraction."""
+    structured, warnings, context = parse_structured_quiz(text)
+    if structured:
+        questions, validation_errors = _validate_questions(structured)
+        return questions, "Imported MCQ Quiz", "structured", warnings + validation_errors
+
+    api_key, base_url, model = _get_ai_config()
+    count = int(settings.get("question_count", 10) or 10)
+    if api_key:
+        try:
+            questions, title = await generate_with_ai(
+                text=text,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                count=max(1, min(count, 20)),
+            )
+            questions, validation_errors = _validate_questions(questions)
+            if questions:
+                for question in questions:
+                    question["context"] = question.get("evidence", "")
+                return questions, title, "ai_paragraph", warnings + validation_errors
+        except Exception as exc:
+            logger.warning("AI paragraph generation failed: %s", exc)
+            warnings.append(f"AI generation was unavailable: {str(exc)[:180]}")
+
+    offline, offline_warnings, passage, source_type = create_quiz_from_text(text)
+    warnings.extend(offline_warnings)
+    if offline:
+        questions, validation_errors = _validate_questions(offline[:max(1, min(count, 20))])
+        return questions, "Paragraph Quiz (Extractive)", source_type, warnings + validation_errors
+
+    return [], "", "unrecognized", warnings
+
+
+async def process_source(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: str, source_name: str = "") -> None:
+    if not source_text.strip():
+        await update.effective_message.reply_text("I received an empty text. Send a paragraph or formatted MCQs.")
+        return
+    if len(source_text) > 24000:
+        await update.effective_message.reply_text("This source is too long for one request. Please split it into smaller sections (maximum 24,000 characters per upload).")
         return
 
-    settings = await get_user_settings(user_id)
-    quizzes = parse_multiple_quizzes(saved_data)
-    await send_polls(context, chat_id, quizzes, title, settings, timer, message_thread_id=thread_id)
+    status = await update.effective_message.reply_text("🔎 <b>Reading your source…</b>\nI’m detecting question blocks, answers, explanations and paragraph facts.", parse_mode=ParseMode.HTML)
+    user_id = update.effective_user.id
+    settings = await storage.get_settings(user_id)
+    questions, title, source_type, warnings = await build_quiz(source_text, user_id, settings)
+    if not questions:
+        message = (
+            "I couldn't safely create a quiz from this text.\n\n"
+            "For a paragraph, configure an AI provider in <code>AI_API_KEY</code>, <code>AI_BASE_URL</code> and <code>AI_MODEL</code> for semantic question generation. "
+            "Without AI, I only generate questions from clear definitions, dates, counts and explicit relationships.\n\n"
+            "For ready-made MCQs, mark the right option with ✅ or add <code>Answer: B</code>."
+        )
+        if warnings:
+            message += "\n\n<b>Parser notes:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in warnings[:5])
+        await status.edit_text(message, parse_mode=ParseMode.HTML)
+        return
 
-# --- UI Menus ---
-def get_main_menu():
-    keyboard = [
-        [InlineKeyboardButton("📚 My Quizzes", callback_data="my_quizzes"), InlineKeyboardButton("➕ Create Guide", callback_data="create_guide")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"), InlineKeyboardButton("🌐 Support", url="https://t.me/telegram")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    default_title = title or (source_name.rsplit(".", 1)[0] if source_name else "My Quiz")
+    try:
+        quiz_id = await storage.save_quiz(user_id, default_title, source_text, questions, source_type)
+    except Exception as exc:
+        logger.exception("Could not save quiz")
+        await status.edit_text(f"❌ I created {len(questions)} questions, but saving failed: {html.escape(str(exc)[:250])}", parse_mode=ParseMode.HTML)
+        return
 
-def get_settings_menu(settings):
-    anon_status = "✅ ON" if settings['anonymous'] else "❌ OFF"
-    sq_status = "✅ ON" if settings['shuffle_q'] else "❌ OFF"
-    so_status = "✅ ON" if settings['shuffle_o'] else "❌ OFF"
-    keyboard = [
-        [InlineKeyboardButton(f"🕵️ Anonymous: {anon_status}", callback_data="toggle_anon")],
-        [InlineKeyboardButton(f"🎲 Shuffle Questions: {sq_status}", callback_data="toggle_sq")],
-        [InlineKeyboardButton(f"🔀 Shuffle Options: {so_status}", callback_data="toggle_so")],
-        [InlineKeyboardButton("⏱ Poll Timer", callback_data="timer_menu")],
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    mode_labels = {"structured": "Formatted MCQs", "ai_paragraph": "AI paragraph interpretation", "extractive": "Offline fact extraction"}
+    mode = mode_labels.get(source_type, source_type)
+    result = (
+        f"✅ <b>Quiz created successfully!</b>\n\n"
+        f"🆔 ID: <code>{quiz_id}</code>\n"
+        f"🏷 Title: <b>{_safe_title(default_title)}</b>\n"
+        f"❓ Questions: <b>{len(questions)}</b>\n"
+        f"🧠 Method: {html.escape(mode)}\n\n"
+        "Choose what to do next:"
+    )
+    if warnings:
+        result += "\n\n<blockquote>Some source lines were skipped or normalized. Check the preview before publishing.</blockquote>"
+    await status.edit_text(result, parse_mode=ParseMode.HTML, reply_markup=quiz_action_menu(quiz_id))
+    context.user_data.pop("input_mode", None)
 
-def get_timer_menu():
-    keyboard = [
-        [InlineKeyboardButton("OFF", callback_data="set_timer_0"), InlineKeyboardButton("10s", callback_data="set_timer_10"), InlineKeyboardButton("30s", callback_data="set_timer_30")],
-        [InlineKeyboardButton("1m", callback_data="set_timer_60"), InlineKeyboardButton("3m", callback_data="set_timer_180"), InlineKeyboardButton("5m", callback_data="set_timer_300")],
-        [InlineKeyboardButton("🔙 Back to Settings", callback_data="settings")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
 
-# --- Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "👋 <b>Welcome to the Ultimate Quiz Maker!</b>\n\nI turn your text into beautiful, forwardable Telegram Quiz Polls.\n\n💡 <i>Use the buttons below to navigate.</i>"
+# ---------------------------------------------------------------------------
+# Poll publishing
+# ---------------------------------------------------------------------------
+def _cancel_markup(run_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel publishing", callback_data=f"cancelrun:{run_id}")]])
+
+
+async def publish_questions(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    quiz: dict[str, Any],
+    settings: dict[str, Any],
+    timer: int,
+    thread_id: int | None,
+    run_id: str,
+    owner_id: int,
+    status_message,
+) -> None:
+    questions = [dict(q) for q in quiz.get("questions", [])]
+    if settings.get("shuffle_q"):
+        import random
+        random.shuffle(questions)
+    active_runs = context.application.bot_data.setdefault("active_runs", {})
+    run_data = active_runs.get(run_id, {})
+    cancel_event: asyncio.Event = run_data.get("cancel_event", asyncio.Event())
+    title = str(quiz.get("title", "Quiz"))
+    sent = 0
+    failed = 0
+    last_error = ""
+    permission_blocked = False
+
+    try:
+        intro = f"🎯 <b>{_safe_title(title)}</b>\n\n📚 {len(questions)} questions are coming up. Good luck!"
+        await context.bot.send_message(chat_id=chat_id, text=intro, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+
+        # A shared paragraph is shown once, not repeated before every question.
+        context_texts = list(dict.fromkeys(str(q.get("context", "")).strip() for q in questions if q.get("context")))
+        if context_texts:
+            passage = "\n\n".join(context_texts)
+            for start in range(0, len(passage), 3800):
+                chunk = passage[start:start + 3800]
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📖 <b>Passage / Context</b>\n\n{html.escape(chunk)}",
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=thread_id,
+                )
+
+        await status_message.edit_text(
+            f"🚀 Publishing <b>{len(questions)}</b> questions…\nSent: 0/{len(questions)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_cancel_markup(run_id),
+        )
+        for index, source_question in enumerate(questions, 1):
+            if cancel_event.is_set():
+                break
+            q = dict(source_question)
+            options = list(q["options"])
+            correct_id = int(q["correct_id"])
+            if settings.get("shuffle_o"):
+                import random
+                paired = [(option, i == correct_id) for i, option in enumerate(options)]
+                random.shuffle(paired)
+                options = [pair[0] for pair in paired]
+                correct_id = next(i for i, pair in enumerate(paired) if pair[1])
+
+            try:
+                await context.bot.send_poll(
+                    chat_id=chat_id,
+                    question=q["question"][:300],
+                    options=options,
+                    type=Poll.QUIZ,
+                    correct_option_id=correct_id,
+                    explanation=(q.get("explanation") or "Review the source text.")[:200],
+                    is_anonymous=bool(settings.get("anonymous", False)),
+                    open_period=timer if 5 <= timer <= 600 else None,
+                    allows_multiple_answers=False,
+                    protect_content=False,
+                    message_thread_id=thread_id,
+                )
+                sent += 1
+            except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 1)
+                try:
+                    await context.bot.send_poll(
+                        chat_id=chat_id, question=q["question"][:300], options=options,
+                        type=Poll.QUIZ, correct_option_id=correct_id,
+                        explanation=(q.get("explanation") or "Review the source text.")[:200],
+                        is_anonymous=bool(settings.get("anonymous", False)),
+                        open_period=timer if 5 <= timer <= 600 else None,
+                        allows_multiple_answers=False, protect_content=False,
+                        message_thread_id=thread_id,
+                    )
+                    sent += 1
+                except TelegramError as retry_exc:
+                    failed += 1
+                    last_error = str(retry_exc)
+                    logger.warning("Poll %s failed after retry: %s", index, retry_exc)
+                    permission_blocked = not sent and any(token in last_error.casefold() for token in ("not enough rights", "chat_write_forbidden", "polls are not allowed", "bot was kicked", "have no rights"))
+            except TelegramError as exc:
+                failed += 1
+                last_error = str(exc)
+                logger.warning("Poll %s failed: %s", index, exc)
+                permission_blocked = not sent and any(token in last_error.casefold() for token in ("not enough rights", "chat_write_forbidden", "polls are not allowed", "bot was kicked", "have no rights"))
+
+            if permission_blocked:
+                break
+            if index % 5 == 0 or index == len(questions):
+                if not cancel_event.is_set():
+                    try:
+                        await status_message.edit_text(
+                            f"🚀 Publishing quiz…\n✅ Sent: {sent}/{len(questions)}\n⚠️ Failed: {failed}",
+                            reply_markup=_cancel_markup(run_id),
+                        )
+                    except TelegramError:
+                        pass
+            # Stay below Telegram group message throughput limits.
+            if index < len(questions) and not cancel_event.is_set():
+                await asyncio.sleep(3.1)
+
+        if cancel_event.is_set():
+            final_text = f"⛔ Publishing cancelled.\n✅ Sent: {sent}\n⚠️ Failed: {failed}"
+        elif permission_blocked:
+            final_text = "❌ The bot cannot publish polls in this group. Make sure it is a member and the group allows ordinary members to send polls."
+        else:
+            final_text = f"🏁 <b>Publishing completed!</b>\n✅ Sent: {sent}/{len(questions)}\n⚠️ Failed: {failed}"
+        if last_error:
+            final_text += f"\n\nDetails: {html.escape(last_error[:180])}"
+        try:
+            await status_message.edit_text(final_text, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+    except TelegramError as exc:
+        logger.exception("Publish run failed")
+        try:
+            await status_message.edit_text(
+                "❌ Telegram could not publish this quiz. Make sure the bot is a member of the group and ordinary members are allowed to send polls.\n\n"
+                f"Details: {html.escape(str(exc)[:220])}",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+    except Exception:
+        logger.exception("Unexpected publishing error")
+        try:
+            await status_message.edit_text("❌ An unexpected error interrupted publishing. Check the Railway logs.")
+        except TelegramError:
+            pass
+    finally:
+        active_runs.pop(run_id, None)
+
+
+async def start_publish(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    quiz: dict[str, Any],
+    settings: dict[str, Any],
+    timer: int | None = None,
+    thread_id: int | None = None,
+    owner_id: int = 0,
+) -> str:
+    questions, errors = _validate_questions(quiz.get("questions", []))
+    if not questions:
+        raise ValueError("This quiz has no valid questions. Re-import it or review the source.")
+    quiz_copy = dict(quiz)
+    quiz_copy["questions"] = questions
+    run_id = uuid.uuid4().hex[:8]
+    effective_timer = int(settings.get("timer", 0) if timer is None else timer)
+    status_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🚀 Preparing <b>{html.escape(str(quiz.get('title', 'Quiz')))}</b>…\n{len(questions)} questions",
+        parse_mode=ParseMode.HTML,
+        message_thread_id=thread_id,
+    )
+    active_runs = context.application.bot_data.setdefault("active_runs", {})
+    active_runs[run_id] = {"owner_id": owner_id, "cancel_event": asyncio.Event()}
+    task = context.application.create_task(
+        publish_questions(context, chat_id, quiz_copy, settings, effective_timer, thread_id, run_id, owner_id, status_message),
+        update=None,
+        name=f"quiz-publish-{run_id}",
+    )
+    active_runs[run_id]["task"] = task
+    return run_id
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("input_mode", None)
+    message = (
+        "👋 <b>Welcome to Poll Quiz Studio</b>\n\n"
+        "Turn formatted MCQs or study paragraphs into Telegram quiz polls. "
+        "Save quizzes in your personal library, preview them, export backups, and publish them in groups.\n\n"
+        "Choose an action below."
+    )
     if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
+        await update.callback_query.edit_message_text(message, parse_mode=ParseMode.HTML, reply_markup=main_menu())
+    elif update.effective_message:
+        await update.effective_message.reply_text(message, parse_mode=ParseMode.HTML, reply_markup=main_menu())
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "📖 <b>How to use Poll Quiz Studio</b>\n\n"
+        "<b>1. Create from a paragraph</b>\nSend a textbook passage, article extract or notes. With an AI provider configured, I create source-grounded questions and check their evidence.\n\n"
+        "<b>2. Import formatted MCQs</b>\nMark the correct option with ✅, or add <code>Answer: B</code>. Explanations are optional.\n\n"
+        "<b>Example format</b>\n<pre>1. What is 2 + 2?\nA) 3\nB) 4 ✅\nC) 5\nD) 6\nExplanation: Two plus two equals four.\n\n2. Which is a primary colour?\nA) Green\nB) Purple\nC) Red ✅\nD) Pink</pre>\n"
+        "<b>3. Publish in a group</b>\nAdd the bot to the group as a member, then use <code>/publish QUIZID</code> or <code>/quizpoll QUIZID</code>. Admin rights are not required when regular members are allowed to send polls.\n\n"
+        "<b>Useful commands</b>\n"
+        "<code>/start</code> — Dashboard\n<code>/library</code> — Saved quizzes\n<code>/publish ID</code> — Publish in this chat\n<code>/quizpoll ID</code> — Publish in this chat (alias)\n"
+        "<code>/pollquiz</code> — Create and publish from command text\n<code>/export ID</code> — Download backup\n<code>/settitle ID Title</code> — Rename\n"
+        "<code>/schedule ID 15m</code> — Schedule\n<code>/myschedules</code> — List schedules\n<code>/cancelschedule ID</code> — Cancel schedule\n<code>/chatid</code> — Show group/topic details"
+    )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+
+
+async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    quizzes = await storage.list_quizzes(user_id, limit=20)
+    if not quizzes:
+        await update.effective_message.reply_text("📭 Your library is empty. Use /start to create your first quiz.", reply_markup=main_menu())
+        return
+    keyboard = []
+    for q in quizzes[:15]:
+        keyboard.append([InlineKeyboardButton(f"📘 {q['id']} · {str(q.get('title', 'Untitled'))[:35]}", callback_data=f"open:{q['id']}")])
+    keyboard.append([InlineKeyboardButton("↩️ Main menu", callback_data="home")])
+    await update.effective_message.reply_text(f"📚 <b>Your quiz library</b>\n{len(quizzes)} recent quizzes", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = await storage.get_settings(update.effective_user.id)
+    await update.effective_message.reply_text("⚙️ <b>Personal publishing settings</b>", parse_mode=ParseMode.HTML, reply_markup=settings_menu(settings))
+
+
+async def save_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    await process_source(update, context, message.text)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    doc = update.effective_message.document
+    filename = doc.file_name or "source.txt"
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if extension not in {"txt", "md", "pdf", "docx"}:
+        await update.effective_message.reply_text("Supported files: .txt, .md, .pdf and .docx.")
+        return
+    if doc.file_size and doc.file_size > 10_000_000:
+        await update.effective_message.reply_text("File is too large. Maximum supported size is 10 MB.")
+        return
+    status = await update.effective_message.reply_text("⏳ Downloading and extracting your source file…")
+    try:
+        telegram_file = await context.bot.get_file(doc.file_id)
+        file_bytes = bytes(await telegram_file.download_as_bytearray())
+        if extension in {"txt", "md"}:
+            try:
+                text = file_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = file_bytes.decode("utf-8", errors="replace")
+                if "\ufffd" in text:
+                    await status.edit_text("❌ I couldn't decode this file as UTF-8. Save it as UTF-8 and upload again.")
+                    return
+        elif extension == "pdf":
+            reader = PdfReader(io.BytesIO(file_bytes))
+            if reader.is_encrypted:
+                await status.edit_text("❌ This PDF is password-protected. Upload an unlocked copy.")
+                return
+            page_texts = []
+            for page_number, page in enumerate(reader.pages, 1):
+                if page_number > 100:
+                    break
+                extracted = (page.extract_text() or "").strip()
+                if extracted:
+                    page_texts.append(f"[Page {page_number}]\n{extracted}")
+            text = "\n\n".join(page_texts)
+            if not text.strip():
+                await status.edit_text("❌ I couldn't extract selectable text from this PDF. Scanned/image-only PDFs need OCR before upload.")
+                return
+        else:
+            document = Document(io.BytesIO(file_bytes))
+            blocks = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    cell_values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if cell_values:
+                        blocks.append(" | ".join(cell_values))
+            text = "\n\n".join(blocks)
+            if not text.strip():
+                await status.edit_text("❌ No readable text was found in this Word document.")
+                return
+        await status.delete()
+        await process_source(update, context, text, source_name=filename)
+    except TelegramError as exc:
+        await status.edit_text(f"❌ File download failed: {html.escape(str(exc)[:180])}", parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.exception("Document extraction failed")
+        await status.edit_text(f"❌ I couldn't read this file: {html.escape(str(exc)[:180])}", parse_mode=ParseMode.HTML)
+
+
+async def settitle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("Usage: <code>/settitle QUIZID New title</code>", parse_mode=ParseMode.HTML)
+        return
+    quiz_id = context.args[0].upper()
+    title = " ".join(context.args[1:]).strip()
+    success = await storage.set_title(quiz_id, title, update.effective_user.id)
+    if success:
+        await update.effective_message.reply_text(f"✅ Title updated for <code>{quiz_id}</code>.", parse_mode=ParseMode.HTML)
+    else:
+        await update.effective_message.reply_text("Quiz not found or you do not own it.")
+
+
+async def export_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz: dict[str, Any]) -> None:
+    content = questions_to_text(quiz.get("questions", []))
+    file = io.BytesIO(content.encode("utf-8"))
+    file.name = f"{quiz['id']}_{re.sub(r'[^A-Za-z0-9_-]+', '_', quiz.get('title', 'quiz'))[:35]}.txt"
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=file,
+        caption=f"📤 Quiz backup · {quiz['id']} · {html.escape(str(quiz.get('title', 'Quiz')))}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /export QUIZID")
+        return
+    quiz = await storage.get_quiz(context.args[0].upper(), update.effective_user.id)
+    if not quiz:
+        await update.effective_message.reply_text("Quiz not found or you do not own it.")
+        return
+    if not quiz.get("questions") and quiz.get("source_text"):
+        questions, _, _, _ = create_quiz_from_text(quiz["source_text"])
+        quiz["questions"] = questions
+    await export_quiz(context, update.effective_chat.id, quiz)
+
+
+async def delete_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /delete QUIZID")
+        return
+    quiz_id = context.args[0].upper()
+    removed = await storage.delete_quiz(quiz_id, update.effective_user.id)
+    await update.effective_message.reply_text("✅ Quiz deleted from your library." if removed else "Quiz not found or you do not own it.")
+
+
+async def _load_owned_quiz(user_id: int, quiz_id: str) -> dict[str, Any] | None:
+    quiz = await storage.get_quiz(quiz_id.upper(), user_id)
+    if not quiz:
+        return None
+    if not quiz.get("questions") and quiz.get("source_text"):
+        parsed, _, _, _ = create_quiz_from_text(quiz["source_text"])
+        quiz["questions"] = parsed
+    return quiz
+
+
+async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: <code>/publish QUIZID</code>\nRun this command in the group where you want the quiz to appear.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    quiz_id = context.args[0].upper()
+    quiz = await _load_owned_quiz(update.effective_user.id, quiz_id)
+    if not quiz:
+        await update.effective_message.reply_text("Quiz not found or you do not own it. Open /library to see your IDs.")
+        return
+    settings = await storage.get_settings(update.effective_user.id)
+    try:
+        await start_publish(
+            context, update.effective_chat.id, quiz, settings,
+            thread_id=getattr(update.effective_message, "message_thread_id", None),
+            owner_id=update.effective_user.id,
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Could not start publishing: {html.escape(str(exc)[:200])}", parse_mode=ParseMode.HTML)
+
+
+async def pollquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias: /quizpoll ID publishes; /pollquiz TEXT parses and publishes immediately."""
+    full_text = update.effective_message.text or ""
+    parts = full_text.split(maxsplit=1)
+    raw = parts[1].strip() if len(parts) > 1 else ""
+    if not raw and update.effective_message.reply_to_message:
+        replied = update.effective_message.reply_to_message
+        raw = (replied.text or replied.caption or "").strip()
+    if not raw:
+        await update.effective_message.reply_text(
+            "Reply to a formatted MCQ message with /pollquiz, or use /quizpoll QUIZID to publish a saved quiz.\n"
+            "For long paragraphs, create and review the quiz in private chat first.",
+        )
+        return
+    if len(context.args) == 1 and re.fullmatch(r"[A-Za-z0-9_-]{4,12}", raw):
+        quiz = await _load_owned_quiz(update.effective_user.id, raw.upper())
+        if not quiz:
+            await update.effective_message.reply_text("Quiz not found or you do not own it.")
+            return
+        settings = await storage.get_settings(update.effective_user.id)
+        try:
+            await start_publish(context, update.effective_chat.id, quiz, settings,
+                                thread_id=getattr(update.effective_message, "message_thread_id", None),
+                                owner_id=update.effective_user.id)
+        except Exception as exc:
+            await update.effective_message.reply_text(f"Could not start publishing: {html.escape(str(exc)[:200])}", parse_mode=ParseMode.HTML)
+        return
+    settings = await storage.get_settings(update.effective_user.id)
+    questions, warnings, leading_context = parse_structured_quiz(raw)
+    if not questions:
+        await update.effective_message.reply_text("I couldn't parse this command as complete MCQs. Create the quiz in private chat with /start so I can show you the preview first.")
+        return
+    for question in questions:
+        if leading_context:
+            question["context"] = leading_context
+    title = "Instant Quiz"
+    quiz = {"id": "INSTANT", "title": title, "questions": questions}
+    try:
+        await start_publish(context, update.effective_chat.id, quiz, settings,
+                            thread_id=getattr(update.effective_message, "message_thread_id", None),
+                            owner_id=update.effective_user.id)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Could not start publishing: {html.escape(str(exc)[:200])}", parse_mode=ParseMode.HTML)
+
+
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    thread_id = getattr(update.effective_message, "message_thread_id", None)
+    await update.effective_message.reply_text(
+        f"<b>Chat:</b> {html.escape(chat.title or chat.type)}\n<b>Chat ID:</b> <code>{chat.id}</code>\n<b>Topic ID:</b> <code>{thread_id if thread_id else 'General / none'}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: <code>/schedule QUIZID 15m</code> (minutes m, hours h, days d)", parse_mode=ParseMode.HTML)
+        return
+    quiz_id, raw_delay = context.args[0].upper(), context.args[1].lower()
+    match = re.fullmatch(r"(\d{1,4})([mhd])", raw_delay)
+    if not match:
+        await update.effective_message.reply_text("Invalid time. Examples: 15m, 2h, 1d")
+        return
+    amount, unit = int(match.group(1)), match.group(2)
+    delay = amount * {"m": 60, "h": 3600, "d": 86400}[unit]
+    if delay < 60 or delay > 30 * 86400:
+        await update.effective_message.reply_text("Choose a schedule between 1 minute and 30 days.")
+        return
+    quiz = await _load_owned_quiz(update.effective_user.id, quiz_id)
+    if not quiz:
+        await update.effective_message.reply_text("Quiz not found or you do not own it.")
+        return
+    settings = await storage.get_settings(update.effective_user.id)
+    run_at = time.time() + delay
+    thread_id = getattr(update.effective_message, "message_thread_id", None)
+    schedule_id = await storage.add_schedule(quiz_id, update.effective_user.id, update.effective_chat.id, thread_id, run_at, int(settings.get("timer", 0)))
+    local_time = datetime.fromtimestamp(run_at).astimezone().strftime("%d %b %Y, %I:%M %p %Z")
+    await update.effective_message.reply_text(
+        f"✅ <b>Quiz scheduled</b>\nID: <code>{quiz_id}</code>\nSchedule ID: <code>{schedule_id}</code>\nRun time: <b>{local_time}</b>\n\nUse /myschedules to view or /cancelschedule {schedule_id} to cancel.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    due = await storage.due_schedules(time.time())
+    for scheduled in due:
+        # Remove first to provide at-most-once behavior if a process crashes during delivery.
+        await storage.remove_schedule(scheduled["id"])
+        quiz = await _load_owned_quiz(int(scheduled["user_id"]), scheduled["quiz_id"])
+        if not quiz:
+            try:
+                await context.bot.send_message(chat_id=scheduled["chat_id"], text=f"⚠️ Scheduled quiz {scheduled['quiz_id']} no longer exists.", message_thread_id=scheduled.get("thread_id"))
+            except TelegramError:
+                pass
+            continue
+        settings = await storage.get_settings(int(scheduled["user_id"]))
+        try:
+            await start_publish(
+                context, int(scheduled["chat_id"]), quiz, settings,
+                timer=int(scheduled.get("timer", 0)),
+                thread_id=scheduled.get("thread_id"),
+                owner_id=int(scheduled["user_id"]),
+            )
+        except Exception:
+            logger.exception("Scheduled quiz could not start: %s", scheduled.get("id"))
+
+
+async def cancelschedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /cancelschedule SCHEDULE_ID")
+        return
+    schedule_id = context.args[0].upper()
+    removed = await storage.remove_schedule(schedule_id, update.effective_user.id)
+    await update.effective_message.reply_text("✅ Schedule cancelled." if removed else "No matching schedule found for your account.")
+
+
+async def myschedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    schedules = await storage.list_schedules(update.effective_chat.id, update.effective_user.id)
+    if not schedules:
+        await update.effective_message.reply_text("📭 No pending schedules in this chat.")
+        return
+    lines = ["⏰ <b>Scheduled quizzes</b>"]
+    for item in schedules[:20]:
+        when = datetime.fromtimestamp(float(item["run_at"])).astimezone().strftime("%d %b, %I:%M %p")
+        lines.append(f"• <code>{item['id']}</code> · quiz <code>{item['quiz_id']}</code> · {when}")
+    lines.append("\nCancel with /cancelschedule SCHEDULE_ID")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    active_runs = context.application.bot_data.setdefault("active_runs", {})
+    owner_id = update.effective_user.id
+    matches = [(run_id, run) for run_id, run in active_runs.items() if run.get("owner_id") == owner_id]
+    if not matches:
+        await update.effective_message.reply_text("You do not have an active publishing task.")
+        return
+    for _, run in matches:
+        run["cancel_event"].set()
+    await update.effective_message.reply_text("⛔ Cancellation requested. The current poll may finish before the bot stops.")
+
+
+# ---------------------------------------------------------------------------
+# Inline callbacks
+# ---------------------------------------------------------------------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    
-    if query.data == "create_guide":
-        text = (
-            "📝 <b>How to Create a Quiz</b>\n\n"
-            "Send me your quiz text directly, OR upload a <b>.txt file</b>.\n\n"
-            "<code>What is 2+2?\n"
-            "a) 3\n"
-            "b) 4 ✅\n"
-            "c) 5\n"
-            "Ex: Basic math</code>\n\n"
-            "✅ Mark correct answer with a tick.\n"
-            "🏷 <b>Pro Tip:</b> Use <code>/settitle &lt;ID&gt; &lt;Title&gt;</code> to name your quiz!\n"
-            "⏰ <b>Schedule:</b> Use <code>/schedule &lt;ID&gt; 15m</code> to post later."
-        )
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-        
-    elif query.data == "my_quizzes":
-        quizzes = await get_user_quizzes(user_id)
-        if not quizzes:
-            text = "📭 <b>You haven't saved any quizzes yet!</b>"
-        else:
-            text = f"📚 <b>Your Saved Quizzes ({len(quizzes)})</b>\n\n"
-            for q in quizzes[:15]:
-                title = q.get('title', 'Untitled Quiz')
-                text += f"🆔 <code>{q['id']}</code> - <b>{title}</b>\n"
-            text += "\n💡 <b>To deploy:</b> <code>/quizpoll &lt;ID&gt;</code>"
-            text += "\n📥 <b>To export:</b> <code>/export &lt;ID&gt;</code>"
-        
-        keyboard = []
-        if quizzes:
-            keyboard.append([InlineKeyboardButton("🗑 Delete a Quiz", callback_data="delete_menu")])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-        
-    elif query.data == "delete_menu":
-        quizzes = await get_user_quizzes(user_id)
-        keyboard = [[InlineKeyboardButton(f"🗑 {q['id']}", callback_data=f"del_{q['id']}")] for q in quizzes[:10]]
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")])
-        await query.edit_message_text("Select a quiz to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
-        
-    elif query.data.startswith("del_"):
-        quiz_id = query.data.split("_")[1]
-        success = await delete_quiz_from_db(quiz_id, user_id)
-        msg = f"✅ Quiz <code>{quiz_id}</code> deleted!" if success else "❌ Failed to delete."
-        await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my_quizzes")]]))
+    data = query.data or ""
 
-    elif query.data == "settings":
-        settings = await get_user_settings(user_id)
-        await query.edit_message_text("⚙️ <b>Bot Settings</b>\n\nCustomize how your quizzes are sent.", reply_markup=get_settings_menu(settings), parse_mode='HTML')
-        
-    elif query.data == "toggle_anon":
-        settings = await get_user_settings(user_id)
-        await update_user_setting(user_id, "anonymous", not settings['anonymous'])
-        await query.edit_message_reply_markup(reply_markup=get_settings_menu(await get_user_settings(user_id)))
-
-    elif query.data == "toggle_sq":
-        settings = await get_user_settings(user_id)
-        await update_user_setting(user_id, "shuffle_q", not settings['shuffle_q'])
-        await query.edit_message_reply_markup(reply_markup=get_settings_menu(await get_user_settings(user_id)))
-
-    elif query.data == "toggle_so":
-        settings = await get_user_settings(user_id)
-        await update_user_setting(user_id, "shuffle_o", not settings['shuffle_o'])
-        await query.edit_message_reply_markup(reply_markup=get_settings_menu(await get_user_settings(user_id)))
-        
-    elif query.data == "timer_menu":
-        await query.edit_message_text("⏱ <b>Select Default Poll Timer:</b>", reply_markup=get_timer_menu(), parse_mode='HTML')
-        
-    elif query.data.startswith("set_timer_"):
-        timer = int(query.data.split("_")[2])
-        await update_user_setting(user_id, "timer", timer)
-        settings = await get_user_settings(user_id)
-        await query.edit_message_text(f"✅ Timer set to {timer} seconds!\n\n⚙️ <b>Bot Settings</b>", reply_markup=get_settings_menu(settings), parse_mode='HTML')
-
-    elif query.data == "back":
+    if data in ("home", "back"):
         await start(update, context)
-
-async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    quiz_id = await save_quiz_to_db(text, update.effective_user.id)
-    quizzes = parse_multiple_quizzes(text)
-    
-    if not quizzes:
-        await update.message.reply_text("❌ Could not parse any valid questions. Check your formatting.")
         return
-
-    success_text = (
-        f"✅ <b>Successfully Saved {len(quizzes)} Question(s)!</b>\n\n"
-        f"🆔 <b>Quiz ID:</b> <code>{quiz_id}</code>\n"
-        f"👉 <i>Use <code>/quizpoll {quiz_id}</code> to deploy.</i>\n"
-        f"📥 <i>Use <code>/export {quiz_id}</code> to backup.</i>\n\n"
-        f"🏷 <b>Name it:</b> <code>/settitle {quiz_id} Name</code>"
-    )
-    await update.message.reply_text(success_text, parse_mode='HTML')
-    
-    settings = await get_user_settings(update.effective_user.id)
-    await send_polls(context, update.effective_chat.id, quizzes[:1], "Preview", settings, settings['timer'])
-
-async def save_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not re.search(r'^[a-zA-Z]\)', text, re.MULTILINE):
-        await update.message.reply_text("❌ <b>Format not recognized.</b>\nTap 'Create Guide' in the /start menu.", parse_mode='HTML')
-        return
-    await process_and_save(update, context, text)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ Please upload a standard `.txt` file.")
-        return
-    
-    msg = await update.message.reply_text("⏳ Downloading and parsing file...")
-    file = await context.bot.get_file(doc.file_id)
-    file_bytes = await file.download_as_bytearray()
-    
-    try:
-        text = file_bytes.decode('utf-8')
-    except UnicodeDecodeError:
-        await msg.edit_text("❌ Error: File must be UTF-8 encoded text.")
-        return
-        
-    await msg.delete()
-    await process_and_save(update, context, text)
-
-async def settitle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("💡 Usage: <code>/settitle &lt;ID&gt; &lt;New Title&gt;</code>", parse_mode='HTML')
-        return
-    
-    quiz_id = context.args[0].upper()
-    title = " ".join(context.args[1:])
-    
-    success = await set_quiz_title(quiz_id, title, update.effective_user.id)
-    if success:
-        await update.message.reply_text(f"✅ Title for quiz <code>{quiz_id}</code> updated to:\n<b>{title}</b>", parse_mode='HTML')
-    else:
-        await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found or you don't own it.", parse_mode='HTML')
-
-async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("💡 Usage: <code>/export &lt;ID&gt;</code>", parse_mode='HTML')
-        return
-
-    quiz_id = context.args[0].upper()
-    saved_data, title = await get_quiz_from_db(quiz_id)
-    
-    if not saved_data:
-        await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
-        return
-
-    # Create a text file in memory
-    file_bytes = saved_data.encode('utf-8')
-    file_obj = io.BytesIO(file_bytes)
-    file_obj.name = f"{quiz_id}_{title.replace(' ', '_')}.txt"
-    
-    await update.message.reply_document(
-        document=file_obj,
-        caption=f"📥 Here is your backup for quiz <b>{quiz_id}</b>.\nTitle: <b>{title}</b>",
-        parse_mode='HTML'
-    )
-
-async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.job_queue is None:
-        await update.message.reply_text("❌ Scheduling is not available.")
-        return
-        
-    if len(context.args) != 2:
-        await update.message.reply_text("💡 Usage: <code>/schedule &lt;ID&gt; &lt;time&gt;</code>\nExample: <code>/schedule A1B2C3 15m</code>", parse_mode='HTML')
-        return
-
-    quiz_id = context.args[0].upper()
-    time_str = context.args[1].lower()
-    
-    match = re.match(r'^(\d+)([mhd])$', time_str)
-    if not match:
-        await update.message.reply_text("❌ Invalid time format. Use `m` for minutes, `h` for hours, `d` for days (e.g., `15m`).", parse_mode='HTML')
-        return
-        
-    amount = int(match.group(1))
-    unit = match.group(2)
-    
-    if unit == 'm': delay_sec = amount * 60
-    elif unit == 'h': delay_sec = amount * 3600
-    elif unit == 'd': delay_sec = amount * 86400
-    else: delay_sec = 60 
-
-    if delay_sec < 60:
-         await update.message.reply_text("❌ Minimum schedule time is 1 minute.")
-         return
-
-    saved_data, title = await get_quiz_from_db(quiz_id)
-    if not saved_data:
-        await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
-        return
-
-    settings = await get_user_settings(update.effective_user.id)
-    thread_id = getattr(update.effective_message, 'message_thread_id', None)
-    
-    job_data = {
-        "chat_id": update.effective_chat.id,
-        "quiz_id": quiz_id,
-        "thread_id": thread_id,
-        "user_id": update.effective_user.id,
-        "timer": settings['timer']
-    }
-
-    context.job_queue.run_once(scheduled_job, delay_sec, data=job_data, name=f"quiz_{quiz_id}_{update.effective_chat.id}")
-    
-    run_time = datetime.now() + timedelta(seconds=delay_sec)
-    time_formatted = run_time.strftime("%I:%M %p")
-
-    await update.message.reply_text(
-        f"✅ <b>Quiz Scheduled!</b>\n\n"
-        f"🆔 <b>ID:</b> <code>{quiz_id}</code>\n"
-        f"🏷 <b>Title:</b> {title}\n"
-        f"⏰ <b>Time:</b> In {time_str} (at {time_formatted})\n\n"
-        f"<i>I will automatically deploy it in this chat.</i>",
-        parse_mode='HTML'
-    )
-
-async def cancelschedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.job_queue is None:
-        await update.message.reply_text("❌ Scheduling is not available.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("💡 Usage: <code>/cancelschedule &lt;ID&gt;</code>", parse_mode='HTML')
-        return
-
-    quiz_id = context.args[0].upper()
-    chat_id = update.effective_chat.id
-    target_name = f"quiz_{quiz_id}_{chat_id}"
-    
-    job_to_cancel = None
-    for job in context.job_queue.jobs():
-        if job.name == target_name:
-            job_to_cancel = job
-            break
-            
-    if job_to_cancel:
-        job_to_cancel.schedule_removal()
-        await update.message.reply_text(
-            f"✅ <b>Cancelled!</b>\n\nThe scheduled deployment for quiz <code>{quiz_id}</code> has been successfully removed.", 
-            parse_mode='HTML'
+    if data == "create_paragraph":
+        if query.message.chat.type != ChatType.PRIVATE:
+            await query.edit_message_text("For privacy and safe quiz review, open my private chat and use /start to create a quiz. Publishing in this group is still available with /publish QUIZID.", reply_markup=back_menu())
+            return
+        context.user_data["input_mode"] = "paragraph"
+        await query.edit_message_text(
+            "🧠 <b>Paragraph-to-quiz mode</b>\n\nSend a paragraph, chapter extract or study notes. I will identify distinct facts and create source-grounded MCQs.\n\nFor high-quality semantic generation, configure an OpenAI-compatible provider in the environment variables. Without one, the bot uses a conservative offline extractor.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
         )
-    else:
-        await update.message.reply_text(
-            f"❌ No active schedule found for quiz <code>{quiz_id}</code> in this chat.", 
-            parse_mode='HTML'
+        return
+    if data == "create_mcq":
+        if query.message.chat.type != ChatType.PRIVATE:
+            await query.edit_message_text("Please import your MCQ text in my private chat. You can publish saved quizzes here using /publish QUIZID.", reply_markup=back_menu())
+            return
+        context.user_data["input_mode"] = "structured"
+        await query.edit_message_text(
+            "📝 <b>Import MCQs</b>\n\nSend your question set or upload a .txt/.md file. Use ✅ after the correct answer, or add <code>Answer: B</code>. Explanations and shared passages are supported.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
         )
-
-async def myschedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.job_queue is None:
         return
-        
-    chat_id = update.effective_chat.id
-    active_jobs = [job for job in context.job_queue.jobs() if job.data and job.data.get("chat_id") == chat_id]
-    
-    if not active_jobs:
-        await update.message.reply_text("📭 <b>No schedules found.</b>\n\nThere are no quizzes scheduled for this chat right now.", parse_mode='HTML')
+    if data == "group_help":
+        await query.edit_message_text(
+            "🚀 <b>Publish in a group</b>\n\n1. Add this bot to your group.\n2. Normal member access is enough when the group allows members to send polls.\n3. Run <code>/publish QUIZID</code> in the group.\n4. In a forum topic, run the command inside that topic.\n\nAdmin permissions are not required for ordinary group posting. The bot cannot bypass group restrictions that prohibit members from sending polls.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
         return
-        
-    text = "⏰ <b>Active Scheduled Quizzes:</b>\n\n"
-    for job in active_jobs:
-        quiz_id = job.data.get("quiz_id", "Unknown")
-        time_left = job.next_t - datetime.now(job.next_t.tzinfo)
-        mins, secs = divmod(int(time_left.total_seconds()), 60)
-        text += f"🆔 <code>{quiz_id}</code> - Starts in <b>{mins}m {secs}s</b>\n"
-        
-    text += "\n💡 <i>To cancel, use:</i> <code>/cancelschedule &lt;ID&gt;</code>"
-    await update.message.reply_text(text, parse_mode='HTML')
-
-async def quizpoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("💡 Usage: <code>/quizpoll &lt;ID&gt; [timer_seconds]</code>", parse_mode='HTML')
+    if data == "help":
+        await query.edit_message_text(
+            "<b>Quick format</b>\n<pre>1. What is 2 + 2?\nA) 3\nB) 4 ✅\nC) 5\nD) 6\nExplanation: Basic addition.</pre>\n\nYou can also use <code>Answer: B</code> after the choices. I understand numbered questions, A–J labels, wrapped question text, multi-line explanations and a shared passage before the questions.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+    if data == "about":
+        await query.edit_message_text(
+            "<b>Poll Quiz Studio</b>\nA Telegram quiz-poll builder with structured parsing, optional AI-assisted paragraph interpretation, personal storage, exports, group publishing and persistent schedules.\n\nYour saved quizzes are private to your Telegram account.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+    if data == "library":
+        quizzes = await storage.list_quizzes(user_id, limit=20)
+        if not quizzes:
+            await query.edit_message_text("📭 Your quiz library is empty. Create a quiz from the main menu.", reply_markup=back_menu())
+            return
+        keyboard = [[InlineKeyboardButton(f"📘 {q['id']} · {str(q.get('title', 'Untitled'))[:30]}", callback_data=f"open:{q['id']}")] for q in quizzes[:15]]
+        keyboard.append([InlineKeyboardButton("↩️ Main menu", callback_data="home")])
+        await query.edit_message_text(f"📚 <b>My quiz library</b>\nShowing {min(len(quizzes), 15)} recent quizzes.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if data == "settings":
+        settings = await storage.get_settings(user_id)
+        await query.edit_message_text("⚙️ <b>Personal publishing settings</b>", parse_mode=ParseMode.HTML, reply_markup=settings_menu(settings))
+        return
+    if data.startswith("toggle_"):
+        setting_map = {"toggle_anonymous": "anonymous", "toggle_shuffle_q": "shuffle_q", "toggle_shuffle_o": "shuffle_o"}
+        key = setting_map.get(data)
+        if key:
+            settings = await storage.get_settings(user_id)
+            await storage.update_setting(user_id, key, not bool(settings.get(key)))
+            await query.edit_message_reply_markup(reply_markup=settings_menu(await storage.get_settings(user_id)))
+        return
+    if data == "timer_menu":
+        await query.edit_message_text("⏱ <b>Select the default poll timer</b>", parse_mode=ParseMode.HTML, reply_markup=timer_menu())
+        return
+    if data.startswith("timer_"):
+        try:
+            value = int(data.split("_", 1)[1])
+            await storage.update_setting(user_id, "timer", max(0, min(value, 600)))
+            await query.edit_message_text("✅ Timer updated.", reply_markup=settings_menu(await storage.get_settings(user_id)))
+        except ValueError:
+            pass
+        return
+    if data == "count_menu":
+        await query.edit_message_text("🔢 <b>How many questions should paragraph mode create?</b>", parse_mode=ParseMode.HTML, reply_markup=count_menu())
+        return
+    if data.startswith("count_"):
+        try:
+            value = int(data.split("_", 1)[1])
+            await storage.update_setting(user_id, "question_count", max(5, min(value, 20)))
+            await query.edit_message_text("✅ Question count updated.", reply_markup=settings_menu(await storage.get_settings(user_id)))
+        except ValueError:
+            pass
+        return
+    if data.startswith("open:"):
+        quiz_id = data.split(":", 1)[1]
+        quiz = await _load_owned_quiz(user_id, quiz_id)
+        if not quiz:
+            await query.edit_message_text("Quiz not found or you do not own it.", reply_markup=back_menu())
+            return
+        await query.edit_message_text(
+            f"📘 <b>{_safe_title(quiz.get('title', 'Quiz'))}</b>\n\nID: <code>{quiz_id}</code>\nQuestions: <b>{len(quiz.get('questions', []))}</b>\nSource: {html.escape(str(quiz.get('source_type', 'imported')))}\n\nChoose an action:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=quiz_action_menu(quiz_id),
+        )
+        return
+    if data.startswith("publish:"):
+        quiz_id = data.split(":", 1)[1]
+        quiz = await _load_owned_quiz(user_id, quiz_id)
+        if not quiz:
+            await query.edit_message_text("Quiz not found or you do not own it.", reply_markup=back_menu())
+            return
+        settings = await storage.get_settings(user_id)
+        try:
+            # The destination is the chat where the action button was pressed.
+            await start_publish(context, query.message.chat_id, quiz, settings,
+                                thread_id=getattr(query.message, "message_thread_id", None), owner_id=user_id)
+            await query.edit_message_text("🚀 Publishing has started in this chat. Use /cancel to stop your active run.", reply_markup=back_menu())
+        except Exception as exc:
+            await query.edit_message_text(f"Could not publish: {html.escape(str(exc)[:180])}", parse_mode=ParseMode.HTML, reply_markup=back_menu())
+        return
+    if data.startswith("preview:"):
+        quiz_id = data.split(":", 1)[1]
+        quiz = await _load_owned_quiz(user_id, quiz_id)
+        if not quiz:
+            await query.edit_message_text("Quiz not found.", reply_markup=back_menu())
+            return
+        questions = quiz.get("questions", [])
+        if not questions:
+            await query.edit_message_text("No valid questions are saved in this quiz.", reply_markup=back_menu())
+            return
+        sample = questions[0]
+        options_text = "\n".join(f"{'✅' if i == sample['correct_id'] else '▫️'} {html.escape(opt)}" for i, opt in enumerate(sample["options"]))
+        await query.edit_message_text(
+            f"👁 <b>Preview · {html.escape(str(quiz.get('title', 'Quiz')))}</b>\n\n<b>Q1.</b> {html.escape(sample['question'])}\n\n{options_text}\n\n<b>Explanation:</b> {html.escape(sample.get('explanation', ''))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Publish", callback_data=f"publish:{quiz_id}")], [InlineKeyboardButton("↩️ Quiz details", callback_data=f"open:{quiz_id}")]]),
+        )
+        return
+    if data.startswith("export:"):
+        quiz_id = data.split(":", 1)[1]
+        quiz = await _load_owned_quiz(user_id, quiz_id)
+        if not quiz:
+            await query.edit_message_text("Quiz not found.", reply_markup=back_menu())
+            return
+        await export_quiz(context, query.message.chat_id, quiz)
+        return
+    if data.startswith("rename:"):
+        quiz_id = data.split(":", 1)[1]
+        quiz = await _load_owned_quiz(user_id, quiz_id)
+        if not quiz:
+            await query.edit_message_text("Quiz not found.", reply_markup=back_menu())
+            return
+        context.user_data["rename_quiz_id"] = quiz_id
+        await query.edit_message_text(f"Send the new title for <code>{quiz_id}</code> as your next message.", parse_mode=ParseMode.HTML, reply_markup=back_menu())
+        return
+    if data.startswith("delete:"):
+        quiz_id = data.split(":", 1)[1]
+        quiz = await _load_owned_quiz(user_id, quiz_id)
+        if not quiz:
+            await query.edit_message_text("Quiz not found or you do not own it.", reply_markup=back_menu())
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Yes, delete it", callback_data=f"deleteconfirm:{quiz_id}"), InlineKeyboardButton("Keep quiz", callback_data=f"open:{quiz_id}")],
+        ])
+        await query.edit_message_text(f"Are you sure you want to permanently delete <b>{_safe_title(quiz.get('title', quiz_id))}</b> (<code>{quiz_id}</code>)?", parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+    if data.startswith("deleteconfirm:"):
+        quiz_id = data.split(":", 1)[1]
+        removed = await storage.delete_quiz(quiz_id, user_id)
+        await query.edit_message_text("✅ Quiz deleted." if removed else "Quiz not found.", reply_markup=back_menu())
+        return
+    if data.startswith("cancelrun:"):
+        run_id = data.split(":", 1)[1]
+        run = context.application.bot_data.setdefault("active_runs", {}).get(run_id)
+        if not run:
+            await context.bot.send_message(chat_id=query.message.chat_id, text="This publishing run has already finished.")
+            return
+        if run.get("owner_id") != user_id:
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Only the person who started this publishing run can cancel it.")
+            return
+        run["cancel_event"].set()
         return
 
-    quiz_id = context.args[0].upper()
-    saved_data, title = await get_quiz_from_db(quiz_id)
-    
-    if not saved_data:
-        await update.message.reply_text(f"❌ Quiz ID <code>{quiz_id}</code> not found.", parse_mode='HTML')
+
+async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
         return
-
-    settings = await get_user_settings(update.effective_user.id)
-    timer = settings['timer']
-    if len(context.args) > 1:
-        try: timer = int(context.args[1])
-        except ValueError: pass
-
-    quizzes = parse_multiple_quizzes(saved_data)
-    thread_id = getattr(update.effective_message, 'message_thread_id', None)
-    
-    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🚀 <i>Preparing deployment...</i>", parse_mode='HTML', message_thread_id=thread_id)
-    await status_msg.delete()
-    
-    await send_polls(context, update.effective_chat.id, quizzes, title, settings, timer, message_thread_id=thread_id)
-
-async def pollquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("💡 Usage: <code>/pollquiz &lt;text&gt;</code>", parse_mode='HTML')
+    # Rename workflow has priority over source parsing.
+    rename_id = context.user_data.pop("rename_quiz_id", None)
+    if rename_id:
+        success = await storage.set_title(rename_id, message.text.strip(), update.effective_user.id)
+        await message.reply_text("✅ Quiz renamed." if success else "Could not rename this quiz.")
         return
-    text = " ".join(context.args)
-    quizzes = parse_multiple_quizzes(text)
-    settings = await get_user_settings(update.effective_user.id)
-    thread_id = getattr(update.effective_message, 'message_thread_id', None)
-    await send_polls(context, update.effective_chat.id, quizzes, "Instant Quiz", settings, settings['timer'], message_thread_id=thread_id)
+    await process_source(update, context, message.text)
 
-async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not re.search(r'^[a-zA-Z]\)', text, re.MULTILINE):
-        return
-    quizzes = parse_multiple_quizzes(text)
-    settings = await get_user_settings(update.effective_user.id)
-    thread_id = getattr(update.effective_message, 'message_thread_id', None)
-    await send_polls(context, update.effective_chat.id, quizzes, "Quick Quiz", settings, settings['timer'], message_thread_id=thread_id)
 
-def main():
-    Thread(target=run_flask, daemon=True).start()
-    TOKEN = os.environ.get("BOT_TOKEN")
-    if not TOKEN: return
+# ---------------------------------------------------------------------------
+# Application lifecycle
+# ---------------------------------------------------------------------------
+async def post_init(application: Application) -> None:
+    await storage.init()
+    application.bot_data.setdefault("active_runs", {})
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(scheduler_tick, interval=15, first=10, name="persistent-schedule-checker")
+    logger.info("Storage initialized. Poll Quiz Studio is ready.")
 
-    application = Application.builder().token(TOKEN).build()
 
+async def post_shutdown(application: Application) -> None:
+    await storage.close()
+
+
+def main() -> None:
+    Thread(target=run_web_server, daemon=True).start()
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("BOT_TOKEN is missing. Add it to your deployment environment variables.")
+
+    application = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(16)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # Commands are available in private chats and groups. The bot does not auto-post
+    # every message in a group; publishing is always explicit.
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("library", library_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("settitle", settitle_command))
-    application.add_handler(CommandHandler("quizpoll", quizpoll_command))
-    application.add_handler(CommandHandler("pollquiz", pollquiz_command))
     application.add_handler(CommandHandler("export", export_command))
+    application.add_handler(CommandHandler("delete", delete_quiz_command))
+    application.add_handler(CommandHandler("publish", publish_command))
+    application.add_handler(CommandHandler("quizpoll", publish_command))
+    application.add_handler(CommandHandler("pollquiz", pollquiz_command))
+    application.add_handler(CommandHandler("chatid", chatid_command))
     application.add_handler(CommandHandler("schedule", schedule_command))
     application.add_handler(CommandHandler("cancelschedule", cancelschedule_command))
     application.add_handler(CommandHandler("myschedules", myschedules_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, save_quiz))
-    application.add_handler(MessageHandler(filters.Document.MimeType("text/plain") & filters.ChatType.PRIVATE, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_text))
 
-    print("Ultimate Bot is running with Scheduling...")
-    application.run_polling()
+    application.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_private_text))
+
+    logger.info("Poll Quiz Studio is starting…")
+    application.run_polling(drop_pending_updates=False)
+
 
 if __name__ == "__main__":
     main()

@@ -202,8 +202,11 @@ async def build_quiz(text: str, user_id: int, settings: dict[str, Any]) -> tuple
             )
             questions, validation_errors = _validate_questions(questions)
             if questions:
+                # Paragraph-generated items share the original source passage.
+                # Keep the full passage available so it is posted once before
+                # the related poll group, rather than showing isolated snippets.
                 for question in questions:
-                    question["context"] = question.get("evidence", "")
+                    question["context"] = text.strip()
                 return questions, title, "ai_paragraph", warnings + validation_errors
         except Exception as exc:
             logger.warning("AI paragraph generation failed: %s", exc)
@@ -213,6 +216,8 @@ async def build_quiz(text: str, user_id: int, settings: dict[str, Any]) -> tuple
     warnings.extend(offline_warnings)
     if offline:
         questions, validation_errors = _validate_questions(offline[:max(1, min(count, 20))])
+        for question in questions:
+            question["context"] = text.strip()
         return questions, "Paragraph Quiz (Extractive)", source_type, warnings + validation_errors
 
     return [], "", "unrecognized", warnings
@@ -261,7 +266,8 @@ async def process_source(update: Update, context: ContextTypes.DEFAULT_TYPE, sou
         "Choose what to do next:"
     )
     if warnings:
-        result += "\n\n<blockquote>Some source lines were skipped or normalized. Check the preview before publishing.</blockquote>"
+        result += "\n\n<b>Import notes:</b>\n" + "\n".join(f"• {html.escape(item[:220])}" for item in warnings[:3])
+        result += "\n\nCheck the preview before publishing."
     await status.edit_text(result, parse_mode=ParseMode.HTML, reply_markup=quiz_action_menu(quiz_id))
     context.user_data.pop("input_mode", None)
 
@@ -287,7 +293,27 @@ async def publish_questions(
     questions = [dict(q) for q in quiz.get("questions", [])]
     if settings.get("shuffle_q"):
         import random
-        random.shuffle(questions)
+        if any(str(q.get("context", "")).strip() for q in questions):
+            # Keep passage groups in source order. Shuffle only within each
+            # group so a shared Directions paragraph always stays above the
+            # questions that depend on it.
+            grouped_questions: list[list[dict[str, Any]]] = []
+            current_group: list[dict[str, Any]] = []
+            current_context: str | None = None
+            for item in questions:
+                item_context = str(item.get("context", "")).strip()
+                if current_group and item_context != current_context:
+                    random.shuffle(current_group)
+                    grouped_questions.append(current_group)
+                    current_group = []
+                current_context = item_context
+                current_group.append(item)
+            if current_group:
+                random.shuffle(current_group)
+                grouped_questions.append(current_group)
+            questions = [item for group in grouped_questions for item in group]
+        else:
+            random.shuffle(questions)
     active_runs = context.application.bot_data.setdefault("active_runs", {})
     run_data = active_runs.get(run_id, {})
     cancel_event: asyncio.Event = run_data.get("cancel_event", asyncio.Event())
@@ -301,28 +327,27 @@ async def publish_questions(
         intro = f"🎯 <b>{_safe_title(title)}</b>\n\n📚 {len(questions)} questions are coming up. Good luck!"
         await context.bot.send_message(chat_id=chat_id, text=intro, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
 
-        # A shared paragraph is shown once, not repeated before every question.
-        context_texts = list(dict.fromkeys(str(q.get("context", "")).strip() for q in questions if q.get("context")))
-        if context_texts:
-            passage = "\n\n".join(context_texts)
-            for start in range(0, len(passage), 3800):
-                chunk = passage[start:start + 3800]
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"📖 <b>Passage / Context</b>\n\n{html.escape(chunk)}",
-                    parse_mode=ParseMode.HTML,
-                    message_thread_id=thread_id,
-                )
-
         await status_message.edit_text(
             f"🚀 Publishing <b>{len(questions)}</b> questions…\nSent: 0/{len(questions)}",
             parse_mode=ParseMode.HTML,
             reply_markup=_cancel_markup(run_id),
         )
+        last_context = ""
         for index, source_question in enumerate(questions, 1):
             if cancel_event.is_set():
                 break
             q = dict(source_question)
+            question_context = str(q.get("context", "")).strip()
+            if question_context and question_context != last_context:
+                for start in range(0, len(question_context), 3800):
+                    chunk = question_context[start:start + 3800]
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"📖 <b>Read this information for the next questions</b>\n\n{html.escape(chunk)}",
+                        parse_mode=ParseMode.HTML,
+                        message_thread_id=thread_id,
+                    )
+            last_context = question_context
             options = list(q["options"])
             correct_id = int(q["correct_id"])
             if settings.get("shuffle_o"):
@@ -676,13 +701,10 @@ async def pollquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.effective_message.reply_text(f"Could not start publishing: {html.escape(str(exc)[:200])}", parse_mode=ParseMode.HTML)
         return
     settings = await storage.get_settings(update.effective_user.id)
-    questions, warnings, leading_context = parse_structured_quiz(raw)
+    questions, warnings, _combined_context = parse_structured_quiz(raw)
     if not questions:
         await update.effective_message.reply_text("I couldn't parse this command as complete MCQs. Create the quiz in private chat with /start so I can show you the preview first.")
         return
-    for question in questions:
-        if leading_context:
-            question["context"] = leading_context
     title = "Instant Quiz"
     quiz = {"id": "INSTANT", "title": title, "questions": questions}
     try:
@@ -926,8 +948,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         sample = questions[0]
         options_text = "\n".join(f"{'✅' if i == sample['correct_id'] else '▫️'} {html.escape(opt)}" for i, opt in enumerate(sample["options"]))
+        sample_context = str(sample.get("context", "")).strip()
+        context_preview = (f"📖 <b>Shared passage</b>\n{html.escape(sample_context[:900])}\n\n" if sample_context else "")
         await query.edit_message_text(
-            f"👁 <b>Preview · {html.escape(str(quiz.get('title', 'Quiz')))}</b>\n\n<b>Q1.</b> {html.escape(sample['question'])}\n\n{options_text}\n\n<b>Explanation:</b> {html.escape(sample.get('explanation', ''))}",
+            f"👁 <b>Preview · {html.escape(str(quiz.get('title', 'Quiz')))}</b>\n❓ {len(questions)} questions\n\n{context_preview}<b>Q1.</b> {html.escape(sample['question'])}\n\n{options_text}\n\n<b>Explanation:</b> {html.escape(sample.get('explanation', ''))}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Publish", callback_data=f"publish:{quiz_id}")], [InlineKeyboardButton("↩️ Quiz details", callback_data=f"open:{quiz_id}")]]),
         )

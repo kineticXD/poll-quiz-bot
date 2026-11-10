@@ -1,4 +1,8 @@
-python-telegram-bot==22.4
+python-telegram-bot[job-queue]==22.4
 Flask==3.0.3
 motor==3.6.0
-apscheduler==3.10.4
+aiosqlite==0.21.0
+httpx==0.28.1
+pypdf>=5.0,<7
+python-docx>=1.1,<2
+python-dotenv>=1.0,<2

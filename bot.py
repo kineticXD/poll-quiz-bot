@@ -91,6 +91,10 @@ def settings_menu(settings: dict[str, Any]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🕵️ Anonymous polls: {state('anonymous')}", callback_data="toggle_anonymous")],
         [InlineKeyboardButton(f"🎲 Shuffle questions: {state('shuffle_q')}", callback_data="toggle_shuffle_q")],
         [InlineKeyboardButton(f"🔀 Shuffle options: {state('shuffle_o')}", callback_data="toggle_shuffle_o")],
+        [InlineKeyboardButton(
+            f"🏆 End-of-quiz score poll: {'ON ✅' if settings.get('score_poll', True) else 'OFF ❌'}",
+            callback_data="toggle_score_poll",
+        )],
         [InlineKeyboardButton(f"⏱ Poll timer: {timer_text}", callback_data="timer_menu")],
         [InlineKeyboardButton(f"🔢 Paragraph question count: {count}", callback_data="count_menu")],
         [InlineKeyboardButton("↩️ Main menu", callback_data="home")],
@@ -411,12 +415,68 @@ async def publish_questions(
             if index < len(questions) and not cancel_event.is_set():
                 await asyncio.sleep(3.1)
 
+        score_poll_sent = False
+        score_poll_enabled = bool(settings.get("score_poll", True))
+
+        # Post the self-reported score poll only after every quiz question was
+        # successfully published. A cancelled or partially failed quiz should
+        # not ask participants to rate an incomplete attempt.
+        if (
+            score_poll_enabled
+            and not cancel_event.is_set()
+            and not permission_blocked
+            and sent == len(questions)
+            and failed == 0
+        ):
+            score_options = [
+                "0-20% 💀",
+                "21-40% 😕",
+                "41-60% 😐",
+                "61-80% 🙂",
+                "81-100% 🔥",
+            ]
+            try:
+                try:
+                    await context.bot.send_poll(
+                        chat_id=chat_id,
+                        question="🏆 Quiz Completed!\n\nHow many marks did you get?",
+                        options=score_options,
+                        type=Poll.REGULAR,
+                        is_anonymous=False,
+                        allows_multiple_answers=False,
+                        protect_content=False,
+                        message_thread_id=thread_id,
+                    )
+                    score_poll_sent = True
+                except RetryAfter as exc:
+                    # One respectful retry for Telegram's temporary rate limit.
+                    await asyncio.sleep(float(exc.retry_after) + 1)
+                    await context.bot.send_poll(
+                        chat_id=chat_id,
+                        question="🏆 Quiz Completed!\n\nHow many marks did you get?",
+                        options=score_options,
+                        type=Poll.REGULAR,
+                        is_anonymous=False,
+                        allows_multiple_answers=False,
+                        protect_content=False,
+                        message_thread_id=thread_id,
+                    )
+                    score_poll_sent = True
+            except TelegramError as score_exc:
+                # The score poll is an optional follow-up; its failure must not
+                # change the result of the quiz questions already published.
+                logger.warning("End-of-quiz score poll could not be sent: %s", score_exc)
+
         if cancel_event.is_set():
             final_text = f"⛔ Publishing cancelled.\n✅ Sent: {sent}\n⚠️ Failed: {failed}"
         elif permission_blocked:
             final_text = "❌ The bot cannot publish polls in this group. Make sure it is a member and the group allows ordinary members to send polls."
         else:
             final_text = f"🏁 <b>Publishing completed!</b>\n✅ Sent: {sent}/{len(questions)}\n⚠️ Failed: {failed}"
+            if score_poll_sent:
+                final_text += "\n🏆 Score self-assessment poll posted."
+            elif score_poll_enabled and (sent != len(questions) or failed):
+                final_text += "\nℹ️ Score poll skipped because the quiz did not publish completely."
         if last_error:
             final_text += f"\n\nDetails: {html.escape(last_error[:180])}"
         try:
@@ -880,12 +940,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("⚙️ <b>Personal publishing settings</b>", parse_mode=ParseMode.HTML, reply_markup=settings_menu(settings))
         return
     if data.startswith("toggle_"):
-        setting_map = {"toggle_anonymous": "anonymous", "toggle_shuffle_q": "shuffle_q", "toggle_shuffle_o": "shuffle_o"}
+        setting_map = {
+            "toggle_anonymous": "anonymous",
+            "toggle_shuffle_q": "shuffle_q",
+            "toggle_shuffle_o": "shuffle_o",
+            "toggle_score_poll": "score_poll",
+        }
         key = setting_map.get(data)
         if key:
             settings = await storage.get_settings(user_id)
-            await storage.update_setting(user_id, key, not bool(settings.get(key)))
-            await query.edit_message_reply_markup(reply_markup=settings_menu(await storage.get_settings(user_id)))
+            # The end-of-quiz score poll is ON by default for existing and new users.
+            current_value = settings.get(key, True if key == "score_poll" else False)
+            await storage.update_setting(user_id, key, not bool(current_value))
+            await query.edit_message_reply_markup(
+                reply_markup=settings_menu(await storage.get_settings(user_id))
+            )
         return
     if data == "timer_menu":
         await query.edit_message_text("⏱ <b>Select the default poll timer</b>", parse_mode=ParseMode.HTML, reply_markup=timer_menu())

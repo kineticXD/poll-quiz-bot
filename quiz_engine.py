@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 CHECK_MARKS = ("✅", "✔️", "✔", "☑️", "☑", "✓")
+MAX_POLL_OPTIONS = 12  # Telegram Bot API 9.1; python-telegram-bot >= 22.3
 NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -24,7 +25,7 @@ NUMBER_WORDS = {
 }
 NUMBER_WORD_PATTERN = "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
 OPTION_RE = re.compile(
-    r"^\s*(?:\(([A-Ja-j])\)|([A-Ja-j])[.)]|([A-Ja-j])\s*[:\-])\s*(.*?)\s*$"
+    r"^\s*(?:\(([A-Za-z])\)|([A-Za-z])[.)]|([A-Za-z])\s*[:\-])\s*(.*?)\s*$"
 )
 QUESTION_MARKER_RE = re.compile(r"^\s*(?:(?:Q(?:uestion)?\s*)?\d{1,3}[.)\]:-]|Q(?:uestion)?\s*\d+\s*[:.)-])\s*", re.I)
 ANSWER_RE = re.compile(r"^\s*(?:correct\s+answer|correct\s+option|answer|ans|correct)\s*[:\-]\s*(.*?)\s*$", re.I)
@@ -48,7 +49,7 @@ def _strip_marker(line: str) -> tuple[str, bool]:
 def _resolve_answer(answer_text: str, options: list[str]) -> int | None:
     answer_text = answer_text.strip()
     answer_text = re.sub(r"^(?:option|choice)\s+", "", answer_text, flags=re.I)
-    m = re.match(r"^\(?([A-Ja-j])\)?(?:\s|[).:-]|$)", answer_text)
+    m = re.match(r"^\(?([A-Za-z])\)?(?:\s|[).:-]|$)", answer_text)
     if m:
         index = ord(m.group(1).upper()) - ord("A")
         if 0 <= index < len(options):
@@ -159,8 +160,8 @@ def parse_structured_quiz(text: str) -> tuple[list[dict[str, Any]], list[str], s
             warnings.append("Found answer options without a question stem.")
         elif len(options) < 2:
             warnings.append(f"Skipped '{question[:55]}': fewer than two options were found.")
-        elif len(options) > 10:
-            warnings.append(f"Skipped '{question[:55]}': Telegram quizzes allow at most ten options.")
+        elif len(options) > MAX_POLL_OPTIONS:
+            warnings.append(f"Skipped '{question[:55]}': Telegram quizzes allow at most {MAX_POLL_OPTIONS} options.")
         else:
             correct_id: int | None = None
             if len(set(marked_correct)) == 1:
@@ -534,7 +535,7 @@ def validate_ai_quiz(payload: Any, source_text: str, limit: int = 20) -> list[di
         answer = str(item.get("answer", "")).strip()
         evidence = str(item.get("evidence", "")).strip()
         explanation = str(item.get("explanation", "")).strip()
-        if not question or len(question) > 300 or not isinstance(options, list) or not 2 <= len(options) <= 10:
+        if not question or len(question) > 300 or not isinstance(options, list) or not 2 <= len(options) <= MAX_POLL_OPTIONS:
             continue
         options = [str(x).strip() for x in options]
         if any(not x or len(x) > 100 for x in options):

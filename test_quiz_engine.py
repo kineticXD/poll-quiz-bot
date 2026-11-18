@@ -193,5 +193,63 @@ class ParagraphValidationTests(unittest.TestCase):
         self.assertEqual(generate_extractable_questions(source), [])
 
 
+class ExtendedOptionCountTests(unittest.TestCase):
+    def _source(self, labels):
+        return (
+            "Which option is correct?\n"
+            + "\n".join(f"{letter}) {'Correct answer' if i == len(labels)-1 else f'Distractor {i+1}'}"
+                        + (" ✅" if i == len(labels)-1 else "")
+                        for i, letter in enumerate(labels))
+        )
+
+    def test_six_options_accepts_f_as_correct(self):
+        source = self._source(list("ABCDEF"))
+        questions, warnings, _ = parse_structured_quiz(source)
+        self.assertEqual(len(questions), 1, warnings)
+        self.assertEqual(len(questions[0]["options"]), 6)
+        self.assertEqual(questions[0]["correct_id"], 5)
+
+    def test_twelve_options_accepts_l_as_correct(self):
+        source = self._source(list("ABCDEFGHIJKL"))
+        questions, warnings, _ = parse_structured_quiz(source)
+        self.assertEqual(len(questions), 1, warnings)
+        self.assertEqual(len(questions[0]["options"]), 12)
+        self.assertEqual(questions[0]["correct_id"], 11)
+
+    def test_answer_key_can_reference_l(self):
+        source = (
+            "Which option is correct?\n"
+            + "\n".join(f"{letter}) Option {i+1}" for i, letter in enumerate("ABCDEFGHIJKL"))
+            + "\nAnswer: L"
+        )
+        questions, warnings, _ = parse_structured_quiz(source)
+        self.assertEqual(len(questions), 1, warnings)
+        self.assertEqual(questions[0]["correct_id"], 11)
+
+    def test_thirteen_options_are_rejected_instead_of_truncated(self):
+        source = self._source(list("ABCDEFGHIJKLM"))
+        questions, warnings, _ = parse_structured_quiz(source)
+        self.assertEqual(questions, [])
+        self.assertTrue(any("at most 12 options" in warning for warning in warnings), warnings)
+
+    def test_ai_validator_accepts_twelve_options(self):
+        from quiz_engine import validate_ai_quiz
+        source = "The answer is Option 12."
+        options = [f"Option {i}" for i in range(1, 13)]
+        payload = {
+            "questions": [{
+                "question": "Which option is stated?",
+                "options": options,
+                "answer": "Option 12",
+                "evidence": "The answer is Option 12.",
+                "explanation": "The source explicitly names Option 12.",
+            }]
+        }
+        validated = validate_ai_quiz(payload, source)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(len(validated[0]["options"]), 12)
+        self.assertEqual(validated[0]["correct_id"], 11)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

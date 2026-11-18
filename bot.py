@@ -33,6 +33,7 @@ from docx import Document
 from quiz_engine import (
     create_quiz_from_text, generate_with_ai, parse_structured_quiz,
     questions_to_text,
+    MAX_POLL_OPTIONS,
 )
 from storage import Storage
 
@@ -156,8 +157,8 @@ def _validate_questions(questions: list[dict[str, Any]]) -> tuple[list[dict[str,
         if len(question) > 300:
             errors.append(f"Question {idx}: exceeds Telegram's 300-character limit.")
             continue
-        if not isinstance(options, list) or not 2 <= len(options) <= 10:
-            errors.append(f"Question {idx}: must have 2 to 10 options.")
+        if not isinstance(options, list) or not 2 <= len(options) <= MAX_POLL_OPTIONS:
+            errors.append(f"Question {idx}: must have 2 to {MAX_POLL_OPTIONS} options.")
             continue
         options = [str(option).strip() for option in options]
         if any(not option or len(option) > 100 for option in options):
